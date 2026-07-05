@@ -1472,6 +1472,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--kv-swap-max-active"}, "N",
+        "KV-swap: cap concurrently-generating completion slots; excess lower-priority (then largest-context) requests are parked off-GPU and resumed later (default: 0 = disabled)",
+        [](common_params & params, int value) { params.kv_swap_max_active = value; }
+    ).set_env("LLAMA_ARG_KV_SWAP_MAX_ACTIVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-swap-reserve-mib"}, "N",
+        "KV-swap: park slots when free VRAM drops below N MiB so higher-priority requests can run (default: 0 = disabled)",
+        [](common_params & params, int value) { params.kv_swap_reserve_mib = value; }
+    ).set_env("LLAMA_ARG_KV_SWAP_RESERVE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-swap-ram-mib"}, "N",
+        "KV-swap: RAM budget (MiB) for parked KV blobs before spilling to --kv-swap-dir (default: 0 = keep in RAM)",
+        [](common_params & params, int value) { params.kv_swap_ram_mib = value; }
+    ).set_env("LLAMA_ARG_KV_SWAP_RAM_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-swap-dir"}, "PATH",
+        "KV-swap: directory for disk-spilled parked KV blobs (default: empty = RAM only)",
+        [](common_params & params, const std::string & value) { params.kv_swap_dir = value; }
+    ).set_env("LLAMA_ARG_KV_SWAP_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

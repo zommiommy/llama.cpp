@@ -624,6 +624,10 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t kv_swap_max_active  = 0;   // >0: cap concurrent generating completions; park excess by priority (KV swap)
+    int32_t kv_swap_reserve_mib = 0;   // >0: park slots when free VRAM drops below this many MiB (KV swap watermark)
+    int32_t kv_swap_ram_mib     = 0;   // >0: RAM budget (MiB) for parked KV blobs before spilling to disk
+    std::string kv_swap_dir;           // directory for disk-spilled parked KV blobs (empty = RAM only)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
