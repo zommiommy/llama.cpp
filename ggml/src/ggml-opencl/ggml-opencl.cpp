@@ -17632,6 +17632,8 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .ensure_range   = */ NULL,
+    /* .release_range  = */ NULL,
 };
 
 //
@@ -17876,6 +17878,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .get_lazy_buffer_type = */ NULL,
 };
 }
 
