@@ -61,7 +61,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_num("priority", params.priority))
         ->set_hard_limits(-1000, 1000)
-        ->set_desc("Scheduling priority (default 0, higher wins). When the KV-swap scheduler is enabled (LLAMA_KV_SWAP_MAX_ACTIVE / LLAMA_KV_SWAP_RESERVE_MIB), lower-priority streaming requests are preempted (KV swapped to RAM, spilling to disk) so higher-priority ones run, and resume by priority."));
+        ->set_desc("Scheduling priority (default 0, higher wins). When the KV-swap scheduler is enabled (--kv-swap-max-active / --kv-swap-reserve-mib), lower-priority streaming requests are preempted (KV swapped to RAM, spilling to disk via --kv-swap-dir) so higher-priority ones run, and resume by priority."));
 
     add((new field_num("n_cmpl", params.n_cmpl))
         ->set_hard_limits(1, params_base.n_parallel)
