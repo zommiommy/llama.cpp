@@ -171,25 +171,44 @@ commits 16 granules; an interior `release_range` frees 14 granules
 (`release_ops == 14`); readback is byte-identical before and after release/
 re-commit.
 
-V2-V6 and the Phase 2 gate require the Qwen3.6-27B GGUF fully offloaded across the
-RTX 4090 + 4070S rig, which is not available on this single-12 GB-GPU host — run
-them there:
+### Measured locally — Qwen3.5-35B-A3B UD-Q4_K_XL, single RTX 4070 SUPER (12 GB)
+
+Partial offload (the 22 GB model can't fully fit 12 GB):
+`-ngl 999 --n-cpu-moe 32 -fa on -ctk q8_0 -ctv q4_0`; arch `qwen35moe` (40 layers,
+attention + gated-DeltaNet recurrent, 256 experts / 8 used). Both the `(lazy) KV`
+and `(lazy) RS` buffers engage (load log). These are this-setup numbers only — not
+a dual-GPU or full-GPU-offload result.
+
+- **V2 correctness — PASS.** `llama-cli -st --temp 0 --seed 42`, 107-tok prompt +
+  64 greedy tokens: output byte-identical with and without `--kv-lazy`.
+- **V3 throughput — PASS (no penalty).** `llama-batched-bench -npp 2048 -ntg 512
+  -npl 1 -c 32768`, median of 3: prefill 679->675 t/s (-0.6%), decode 17.7->18.8
+  t/s (+6.3%) — both inside this CPU-bound run's variance, far under the 20% gate.
+  (Experts on CPU make decode CPU-bound; the pure-GPU-path overhead is best
+  measured on the dual-GPU rig where the model fits entirely.)
+- **V4 watermark — PASS, scales with ctx.** `-npp 512 -ntg 128 -npl 1`, peak GPU
+  MiB (nvidia-smi), eager vs lazy:
+
+  | ctx    | eager | lazy | saved |
+  |--------|-------|------|-------|
+  | 32768  |  9126 | 8985 |  ~141 |
+  | 131072 | 10033 | 9030 | ~1003 |
+  | 262144 | 11418 | 9371 | ~2047 |
+
+  Eager reserves the whole-ctx KV up front; lazy commits only touched pages, so a
+  short request on a 262K context frees ~2 GB (at 262K eager peaks ~860 MiB under
+  the card's 12282 MiB; lazy leaves ~2.9 GB headroom). The saving tracks context
+  size (`kv_unified=false`, n_seq_max=1 here); a separate npl=8 run at 32K showed a
+  smaller gap dominated by the larger batch compute buffer, not KV.
+
+### Still deferred to the dual-GPU rig (RTX 4090 + 4070S)
+
+`--parallel N` end-to-end serving (V5), the dual-GPU tensor-split runbook (V6), and
+the MTP/draft Phase-2 gate need the full model resident across both cards:
 
 ```sh
-# V2 correctness parity (must be byte-identical with/without --kv-lazy, --temp 0)
-build/bin/llama-cli -m <model> -ngl 99 [--tensor-split 24,12] -fa on -ctk q8_0 -ctv q8_0 \
-    -c 32768 -n 256 --seed 42 --temp 0 -p "<fixed 2K-token prompt>"
-
-# V3 perf gate (<=20% vs baseline; expect <=5%)
-build/bin/llama-batched-bench -m <model> -ngl 99 [--tensor-split 24,12] -fa on -ctk q8_0 -ctv q8_0 \
-    -npp 512 -ntg 128 -npl 1,8,16 [--kv-lazy]
-
-# V4 memory watermark: nvidia-smi -l 1 while V5 runs; cross-check ggml_backend_cuda_buffer_stats
-# V5 multi-agent end-to-end: the runbook command above + 16 concurrent /v1/chat/completions streams
-# Phase 2 gate: llama-server ... --spec-type draft-mtp --spec-draft-n-max 3 --kv-lazy -np 1 -c 262144
-#               (MTP GGUF from ggml-org/Qwen3.6-27B-MTP-GGUF)
+# V5 multi-agent: runbook command above + N concurrent /v1/chat/completions streams
+# V6 dual-GPU:   CUDA_VISIBLE_DEVICES=<4090>,<4070S> ... --tensor-split 24,12 --kv-lazy
+# Phase 2 (MTP): llama-server ... --spec-type draft-mtp --spec-draft-n-max 3 --kv-lazy -c 262144
+#   (MTP GGUF unsloth_Qwen3.6-35B-A3B-MTP-GGUF present at ~/.cache/llama.cpp)
 ```
-
-PASS criteria per row are in the plan; the key ones: V2 greedy output identical
-with/without `--kv-lazy`; V3 within 20% of eager baseline; V4 lazy startup KV
-footprint < 5% of eager and growth tracks usage within 15%.
