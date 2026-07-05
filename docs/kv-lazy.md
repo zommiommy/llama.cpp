@@ -141,10 +141,16 @@ build/bin/llama-server \
 ## Phase status
 
 - **Phase 1 (base lazy KV, non-MTP serving)** — implemented.
-- **Phase 2 (lazy KV in the MTP path)** — implemented: the MTP / draft
-  `llama_context` inherits `kv_lazy` automatically via
-  `common_context_params_to_llama`, so its caches use the growable buft with no
-  extra code. (Qwen3.6's MTP head is dense-attention-only.)
+- **Phase 2 (lazy KV in the MTP + speculative path)** — implemented; **functional
+  support verified locally**. Server draft/MTP contexts inherit `kv_lazy` via
+  `common_context_params_to_llama`; `llama-speculative{,-simple}` now expose
+  `--kv-lazy` too (added `LLAMA_EXAMPLE_SPECULATIVE`/`_LOOKUP` to the arg). On
+  `Qwen3.6-35B-A3B-MTP` (`--spec-type draft-mtp --kv-lazy`, single 4070 SUPER) the
+  main context (`(lazy) KV` + `(lazy) RS`) **and** the MTP draft context
+  (`creating MTP draft context …` → `kv_lazy = true`, `(lazy) KV = 16 MiB`) both use
+  the growable buft, and MTP decoding worked — 31/48 drafts accepted (65%).
+  (Qwen3.6's MTP head is dense-attention-only: KV, no RS.) The large-context /
+  acceptance-parity MTP gate is still deferred (see Verification).
 - **Phase 3 (performant MTP + `--parallel N`)** — the multi-seq recurrent
   batching this phase targeted is **already present on upstream master**:
   `llm_graph_context::build_rs()` gathers the active sequences' states with
@@ -204,11 +210,12 @@ a dual-GPU or full-GPU-offload result.
 ### Still deferred to the dual-GPU rig (RTX 4090 + 4070S)
 
 `--parallel N` end-to-end serving (V5), the dual-GPU tensor-split runbook (V6), and
-the MTP/draft Phase-2 gate need the full model resident across both cards:
+the **large-context MTP gate** (`-c 262144` + acceptance parity vs non-lazy MTP) need
+the full model resident across both cards:
 
 ```sh
 # V5 multi-agent: runbook command above + N concurrent /v1/chat/completions streams
 # V6 dual-GPU:   CUDA_VISIBLE_DEVICES=<4090>,<4070S> ... --tensor-split 24,12 --kv-lazy
-# Phase 2 (MTP): llama-server ... --spec-type draft-mtp --spec-draft-n-max 3 --kv-lazy -c 262144
-#   (MTP GGUF unsloth_Qwen3.6-35B-A3B-MTP-GGUF present at ~/.cache/llama.cpp)
+# MTP large-ctx: llama-server -m <MTP-gguf> --spec-type draft-mtp --spec-draft-n-max 3 --kv-lazy -c 262144
+#   (functional MTP+kv-lazy already verified locally at small ctx: 31/48 drafts accepted)
 ```
