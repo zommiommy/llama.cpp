@@ -1109,6 +1109,8 @@ static ggml_backend_buffer_i ggml_backend_hexagon_host_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_hexagon_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_hexagon_buffer_clear,
     /* .reset           = */ NULL,
+    /* .ensure_range   = */ NULL,
+    /* .release_range  = */ NULL,
 };
 
 // ** backend buffer type
@@ -7959,6 +7961,7 @@ static const struct ggml_backend_device_i ggml_backend_hexagon_device_i = {
     /* .event_new            = */ ggml_backend_hexagon_device_event_new,
     /* .event_free           = */ ggml_backend_hexagon_device_event_free,
     /* .event_synchronize    = */ ggml_backend_hexagon_device_event_synchronize,
+    /* .get_lazy_buffer_type = */ NULL,
 };
 
 //** backend registry
