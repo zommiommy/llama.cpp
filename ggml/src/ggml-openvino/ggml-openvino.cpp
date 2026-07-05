@@ -420,6 +420,8 @@ static const ggml_backend_buffer_i ggml_backend_openvino_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_openvino_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_openvino_buffer_clear,
     /* .reset           = */ NULL,
+    /* .ensure_range   = */ NULL,
+    /* .release_range  = */ NULL,
 };
 
 // Buffer type interface functions
@@ -1307,6 +1309,7 @@ static const struct ggml_backend_device_i ggml_backend_openvino_device_interface
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .get_lazy_buffer_type = */ NULL,
 };
 
 struct ggml_backend_openvino_reg_context {

@@ -66,6 +66,12 @@ extern "C" {
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
+    // demand-paging hooks for growable buffers:
+    // ensure the byte range [offset, offset+size) is physically resident (commit pages); returns false on OOM.
+    // for buffers without an ensure_range implementation this is a no-op that returns true.
+    GGML_API bool                           ggml_backend_buffer_ensure_range  (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+    // release physical pages of any granule wholly contained in [offset, offset+size); no-op if unsupported.
+    GGML_API void                           ggml_backend_buffer_release_range (ggml_backend_buffer_t buffer, size_t offset, size_t size);
 
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
@@ -184,6 +190,9 @@ extern "C" {
     GGML_API ggml_backend_reg_t            ggml_backend_dev_backend_reg(ggml_backend_dev_t device);
     GGML_API ggml_backend_t                ggml_backend_dev_init(ggml_backend_dev_t device, const char * params);
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_buffer_type(ggml_backend_dev_t device);
+    // (optional) buffer type that reserves virtual address space and commits physical memory on demand.
+    // returns NULL if the device does not support demand paging (fall back to ggml_backend_dev_buffer_type).
+    GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_buffer_type_lazy(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 
