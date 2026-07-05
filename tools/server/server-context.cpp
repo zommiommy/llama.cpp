@@ -226,6 +226,7 @@ struct server_slot {
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
+    int32_t kv_swap_resume_n_decoded = -1; // n_decoded at last kv-swap resume (-1 = not resumed); enforces min residency before re-park
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
@@ -326,6 +327,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        kv_swap_resume_n_decoded = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -855,6 +857,7 @@ private:
     // --- KV-swap preemptive scheduling (parks a running slot's KV off-GPU under VRAM pressure) ---
     struct server_suspended {
         int32_t priority = 0;
+        int64_t suspended_at_us = 0; // park timestamp; resume is FCFS (oldest first) among equal priority
         std::unique_ptr<const server_task> task;
         common_sampler_ptr smpl;
         server_prompt prompt; // prompt.data.{main,drft} holds the serialized tgt/dft KV blob
@@ -956,6 +959,7 @@ private:
     void kv_swap_park(server_slot & slot) {
         server_suspended s;
         s.priority = slot.task->params.priority;
+        s.suspended_at_us = ggml_time_us();
 
         const size_t sz_main = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         s.prompt.data.main.resize(sz_main);
@@ -1027,6 +1031,7 @@ private:
         slot.t_token_generation = s.t_token_generation; slot.lora = s.lora;
         slot.i_batch = -1;
         slot.state = SLOT_STATE_GENERATING;
+        slot.kv_swap_resume_n_decoded = slot.n_decoded; // start the post-resume min-residency window
 
         if (!restore_ok) {
             SLT_ERR(slot, "%s", "kv-swap: failed to restore suspended state; aborting request\n");
@@ -1046,49 +1051,53 @@ private:
 
     // proactive preempt/resume by VRAM watermark; runs at the START of update_slots (safe post-decode boundary)
     void schedule_kv_swap() {
-        if (kv_swap_reserve_mib < 0) { // one-time env init
-            const char * er = getenv("LLAMA_KV_SWAP_RESERVE_MIB");
-            const char * em = getenv("LLAMA_KV_SWAP_MAX_ACTIVE");
-            kv_swap_reserve_mib = er ? atoi(er) : 0;
-            kv_swap_max_active  = em ? atoi(em) : 0;
-            const char * ed  = getenv("LLAMA_KV_SWAP_DIR");
-            const char * erm = getenv("LLAMA_KV_SWAP_RAM_MIB");
-            kv_swap_dir     = ed ? ed : "";
-            kv_swap_ram_mib = erm ? atoi(erm) : 0;
+        if (kv_swap_reserve_mib < 0) { // one-time init from CLI/env params
+            kv_swap_reserve_mib = params_base.kv_swap_reserve_mib;
+            kv_swap_max_active  = params_base.kv_swap_max_active;
+            kv_swap_ram_mib     = params_base.kv_swap_ram_mib;
+            kv_swap_dir         = params_base.kv_swap_dir;
             if (kv_swap_reserve_mib > 0 || kv_swap_max_active > 0)
-                SRV_INF("kv-swap scheduler enabled: reserve=%d MiB, max_active=%d\n", kv_swap_reserve_mib, kv_swap_max_active);
+                SRV_INF("kv-swap scheduler enabled: reserve=%d MiB, max_active=%d, ram=%d MiB, dir='%s'\n",
+                        kv_swap_reserve_mib, kv_swap_max_active, kv_swap_ram_mib, kv_swap_dir.c_str());
         }
         if (kv_swap_reserve_mib <= 0 && kv_swap_max_active <= 0) return;
-        const size_t reserve = (size_t) (kv_swap_reserve_mib > 0 ? kv_swap_reserve_mib : 0) * 1024ull * 1024ull;
+        const size_t  reserve = (size_t) (kv_swap_reserve_mib > 0 ? kv_swap_reserve_mib : 0) * 1024ull * 1024ull;
+        const int32_t MIN_RESIDENCY_TOKENS = 16; // a resumed slot must generate this many tokens before it can be re-parked (anti-thrash/starvation)
 
-        // survey park-eligible (GENERATING completion) slots: count, lowest-priority victim, highest active priority
-        server_slot * victim = nullptr; int maxp = 0; int n_active = 0; bool have = false;
+        // survey park-eligible slots; victim = worst = lowest priority, tie-break LARGEST context
+        // (frees the most VRAM per swap and keeps likely-shorter jobs running). Skip slots still in
+        // their post-resume min-residency window so a resumed request always makes forward progress.
+        server_slot * victim = nullptr; int n_active = 0;
         for (auto & s : slots) {
             if (!kv_swap_park_eligible(s)) continue;
             n_active++;
-            const int p = s.task->params.priority;
-            if (!have || p > maxp) { maxp = p; have = true; }
-            if (!victim || p < victim->task->params.priority) victim = &s;
+            if (s.kv_swap_resume_n_decoded >= 0 && (s.n_decoded - s.kv_swap_resume_n_decoded) < MIN_RESIDENCY_TOKENS) continue;
+            if (!victim) { victim = &s; continue; }
+            const int pv = victim->task->params.priority, ps = s.task->params.priority;
+            if (ps < pv || (ps == pv && s.prompt.n_tokens() > victim->prompt.n_tokens())) victim = &s;
         }
 
         const bool over_count = kv_swap_max_active  > 0 && n_active > kv_swap_max_active;
         const bool over_vram  = kv_swap_reserve_mib > 0 && kv_swap_free_vram() < reserve;
-        // park at most one STRICTLY-lower-priority slot per boundary, never the highest-priority runner;
-        // one action per boundary lets a decode make progress before re-evaluating.
-        if ((over_count || over_vram) && victim && victim->task->params.priority < maxp) {
+        // park the worst victim (one per boundary), but always keep >= 1 slot running
+        if ((over_count || over_vram) && victim && n_active >= 2) {
             kv_swap_park(*victim);
             return;
         }
 
-        // resume the highest-priority parked request when under both caps and a slot is free
+        // resume when under the count cap and a slot is free; highest priority, tie-break OLDEST-parked
+        // (FCFS) so a repeatedly-preempted request eventually resumes (anti-starvation)
         if (kv_swap_max_active > 0 && n_active >= kv_swap_max_active) return;
         while (!suspended.empty()) {
             server_slot * free_slot = nullptr;
             for (auto & s : slots) { if (!s.is_processing()) { free_slot = &s; break; } }
             if (!free_slot) break;
             size_t best = 0;
-            for (size_t i = 1; i < suspended.size(); i++) if (suspended[i].priority > suspended[best].priority) best = i;
-            const size_t need = suspended[best].prompt.data.main.size() + suspended[best].prompt.data.drft.size();
+            for (size_t i = 1; i < suspended.size(); i++) {
+                const int pb = suspended[best].priority, pi = suspended[i].priority;
+                if (pi > pb || (pi == pb && suspended[i].suspended_at_us < suspended[best].suspended_at_us)) best = i;
+            }
+            const size_t need = suspended[best].sz_main + suspended[best].sz_drft;
             if (kv_swap_reserve_mib > 0 && kv_swap_free_vram() < reserve + need) break;
             server_suspended s = std::move(suspended[best]);
             suspended.erase(suspended.begin() + best);
