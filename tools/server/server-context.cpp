@@ -852,6 +852,251 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // --- KV-swap preemptive scheduling (parks a running slot's KV off-GPU under VRAM pressure) ---
+    struct server_suspended {
+        int32_t priority = 0;
+        std::unique_ptr<const server_task> task;
+        common_sampler_ptr smpl;
+        server_prompt prompt; // prompt.data.{main,drft} holds the serialized tgt/dft KV blob
+        std::string disk_path;            // non-empty if the blob was spilled to disk (prompt.data cleared)
+        size_t sz_main = 0, sz_drft = 0;  // serialized blob sizes (valid even when spilled)
+        // generation-state snapshot (restored verbatim on unpark)
+        int32_t n_decoded = 0, n_prompt_tokens_cache = 0, n_prompt_tokens_processed = 0, n_decoded_last = 0;
+        int32_t alora_invocation_start = -1;
+        size_t  last_nl_pos = 0, n_sent_text = 0;
+        std::string generated_text, stopping_word;
+        llama_tokens generated_tokens;
+        std::vector<completion_token_output> generated_token_probs;
+        bool has_new_line = false, truncated = false;
+        stop_type stop = STOP_TYPE_NONE;
+        llama_token sampled = LLAMA_TOKEN_NULL;
+        int64_t t_start_generation = 0;
+        double t_prompt_processing = 0.0, t_token_generation = 0.0;
+        std::vector<common_adapter_lora_info> lora;
+    };
+    std::vector<server_suspended> suspended; // parked requests awaiting resume (priority-ordered on pop)
+    int32_t kv_swap_reserve_mib = -1;         // <0 = uninit (read LLAMA_KV_SWAP_RESERVE_MIB once); 0 = disabled
+    std::string kv_swap_dir;                  // dir for disk-spilled blobs (LLAMA_KV_SWAP_DIR); empty = RAM only
+    int32_t kv_swap_ram_mib     = 0;          // RAM budget (MiB) for resident blobs before spilling to disk
+    int32_t kv_swap_max_active  = 0;          // >0 = cap concurrent generating completions (park excess by priority)
+
+    size_t kv_swap_free_vram() const {
+        size_t total_free = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                total_free += free;
+            }
+        }
+        return total_free;
+    }
+
+    bool kv_swap_park_eligible(const server_slot & slot) const {
+        return slot.state == SLOT_STATE_GENERATING
+            && slot.spec_draft.empty() && slot.spec_i_batch.empty()
+            && slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION
+            && slot.task->params.stream
+            && !slot.task->is_parent() && !slot.task->is_child();
+    }
+
+    size_t kv_swap_ram_used() const {
+        size_t u = 0;
+        for (const auto & s : suspended) u += s.prompt.data.main.size() + s.prompt.data.drft.size();
+        return u;
+    }
+
+    void kv_swap_spill(server_suspended & s) {
+        if (kv_swap_dir.empty() || !s.disk_path.empty()) return;
+        const std::string path = kv_swap_dir + "/kvswap-" + std::to_string(ggml_time_us()) + "-" + std::to_string((uintptr_t) &s) + ".bin";
+        FILE * f = fopen(path.c_str(), "wb");
+        if (!f) { SRV_WRN("kv-swap: cannot open spill file %s\n", path.c_str()); return; }
+        fwrite(s.prompt.data.main.data(), 1, s.prompt.data.main.size(), f);
+        fwrite(s.prompt.data.drft.data(), 1, s.prompt.data.drft.size(), f);
+        fclose(f);
+        s.disk_path = path;
+        s.prompt.data.main.clear(); s.prompt.data.main.shrink_to_fit();
+        s.prompt.data.drft.clear(); s.prompt.data.drft.shrink_to_fit();
+        SRV_INF("kv-swap: spilled %.1f MiB to disk (%s)\n", (s.sz_main + s.sz_drft) / (1024.0*1024.0), path.c_str());
+    }
+
+    bool kv_swap_load(server_suspended & s) {
+        if (s.disk_path.empty()) return true; // resident in RAM
+        FILE * f = fopen(s.disk_path.c_str(), "rb");
+        if (!f) { SRV_ERR("kv-swap: cannot reopen spill file %s\n", s.disk_path.c_str()); return false; }
+        s.prompt.data.main.resize(s.sz_main);
+        s.prompt.data.drft.resize(s.sz_drft);
+        const bool ok = fread(s.prompt.data.main.data(), 1, s.sz_main, f) == s.sz_main
+                     && fread(s.prompt.data.drft.data(), 1, s.sz_drft, f) == s.sz_drft;
+        fclose(f);
+        if (!ok) { SRV_ERR("kv-swap: short read from spill file %s\n", s.disk_path.c_str()); return false; }
+        remove(s.disk_path.c_str());
+        SRV_INF("kv-swap: loaded %.1f MiB from disk (%s)\n", (s.sz_main + s.sz_drft) / (1024.0*1024.0), s.disk_path.c_str());
+        s.disk_path.clear();
+        return true;
+    }
+
+    void kv_swap_maybe_spill() {
+        if (kv_swap_dir.empty() || kv_swap_ram_mib <= 0) return;
+        const size_t budget = (size_t) kv_swap_ram_mib * 1024ull * 1024ull;
+        while (kv_swap_ram_used() > budget) {
+            server_suspended * t = nullptr;
+            for (auto & s : suspended) {
+                if (!s.disk_path.empty()) continue;
+                if (s.prompt.data.main.empty() && s.prompt.data.drft.empty()) continue;
+                if (!t || s.priority < t->priority) t = &s; // spill lowest-priority resident first
+            }
+            if (!t) break;
+            kv_swap_spill(*t);
+        }
+    }
+
+    // snapshot a GENERATING slot's KV (tgt+dft) + generation state off-GPU without finalizing its HTTP response
+    void kv_swap_park(server_slot & slot) {
+        server_suspended s;
+        s.priority = slot.task->params.priority;
+
+        const size_t sz_main = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        s.prompt.data.main.resize(sz_main);
+        llama_state_seq_get_data_ext(slot.ctx_tgt, s.prompt.data.main.data(), sz_main, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (slot.ctx_dft) {
+            const size_t sz_dft = llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            s.prompt.data.drft.resize(sz_dft);
+            llama_state_seq_get_data_ext(slot.ctx_dft, s.prompt.data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        s.task = std::move(slot.task);
+        s.smpl = std::move(slot.smpl);
+        s.prompt.tokens = slot.prompt.tokens.clone();
+        s.n_decoded = slot.n_decoded; s.n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+        s.n_prompt_tokens_processed = slot.n_prompt_tokens_processed; s.n_decoded_last = slot.n_decoded_last;
+        s.alora_invocation_start = slot.alora_invocation_start; s.last_nl_pos = slot.last_nl_pos;
+        s.n_sent_text = slot.n_sent_text; s.generated_text = slot.generated_text; s.stopping_word = slot.stopping_word;
+        s.generated_tokens = slot.generated_tokens; s.generated_token_probs = slot.generated_token_probs;
+        s.has_new_line = slot.has_new_line; s.truncated = slot.truncated; s.stop = slot.stop; s.sampled = slot.sampled;
+        s.t_start_generation = slot.t_start_generation; s.t_prompt_processing = slot.t_prompt_processing;
+        s.t_token_generation = slot.t_token_generation; s.lora = slot.lora;
+
+        common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+        if (slot.ctx_dft) common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+        slot.state = SLOT_STATE_IDLE;
+        // leave the freed slot as clean as release()->reset(), but WITHOUT finalizing the response
+        // (task/smpl/gen-state were moved into `s`; reset() clears the reusable slot fields + unbinds sampler)
+        slot.reset();
+        slot.prompt.tokens.clear();
+        // counters reset() does not clear, else the next task assigned here inherits stale values
+        slot.n_decoded = 0; slot.n_decoded_last = 0; slot.n_prompt_tokens_processed = 0;
+        slot.i_batch = -1;
+        slot.t_start_generation = 0; slot.t_prompt_processing = 0; slot.t_token_generation = 0;
+        slot.t_last_used = ggml_time_us();
+        SLT_INF(slot, "kv-swap: PARKED (priority=%d, blob=%.1f MiB, %zu suspended)\n",
+                s.priority, (s.prompt.data.main.size() + s.prompt.data.drft.size()) / (1024.0*1024.0), suspended.size() + 1);
+        s.sz_main = s.prompt.data.main.size();
+        s.sz_drft = s.prompt.data.drft.size();
+        suspended.push_back(std::move(s));
+        kv_swap_maybe_spill();
+        slot.callback_on_release(slot.id);
+    }
+
+    // restore a parked request into a free slot and continue generating to the same task id
+    void kv_swap_unpark(server_suspended && s, server_slot & slot) {
+        const bool loaded  = kv_swap_load(s);
+        const bool has_dft = slot.ctx_dft && !s.prompt.data.drft.empty();
+        size_t r_main = 0, r_drft = 0;
+        if (loaded) {
+            r_main = llama_state_seq_set_data_ext(slot.ctx_tgt, s.prompt.data.main.data(), s.prompt.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (has_dft) {
+                r_drft = llama_state_seq_set_data_ext(slot.ctx_dft, s.prompt.data.drft.data(), s.prompt.data.drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
+        }
+        const bool restore_ok = loaded && r_main > 0 && (!has_dft || r_drft > 0);
+
+        slot.task = std::move(s.task);
+        slot.smpl = std::move(s.smpl);
+        slot.prompt = std::move(s.prompt);
+        slot.prompt.data.main.clear(); slot.prompt.data.main.shrink_to_fit();
+        slot.prompt.data.drft.clear(); slot.prompt.data.drft.shrink_to_fit();
+        slot.n_decoded = s.n_decoded; slot.n_prompt_tokens_cache = s.n_prompt_tokens_cache;
+        slot.n_prompt_tokens_processed = s.n_prompt_tokens_processed; slot.n_decoded_last = s.n_decoded_last;
+        slot.alora_invocation_start = s.alora_invocation_start; slot.last_nl_pos = s.last_nl_pos;
+        slot.n_sent_text = s.n_sent_text; slot.generated_text = s.generated_text; slot.stopping_word = s.stopping_word;
+        slot.generated_tokens = s.generated_tokens; slot.generated_token_probs = s.generated_token_probs;
+        slot.has_new_line = s.has_new_line; slot.truncated = s.truncated; slot.stop = s.stop; slot.sampled = s.sampled;
+        slot.t_start_generation = s.t_start_generation; slot.t_prompt_processing = s.t_prompt_processing;
+        slot.t_token_generation = s.t_token_generation; slot.lora = s.lora;
+        slot.i_batch = -1;
+        slot.state = SLOT_STATE_GENERATING;
+
+        if (!restore_ok) {
+            SLT_ERR(slot, "%s", "kv-swap: failed to restore suspended state; aborting request\n");
+            common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+            if (slot.ctx_dft) common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+            send_error(slot, "failed to restore suspended request (kv-swap)", ERROR_TYPE_SERVER);
+            slot.release();
+            return;
+        }
+        {
+            // mirror launch_slot_with_task: rebind the sampler to this (possibly different) slot id
+            const bool backend_sampling = slot.task->params.sampling.backend_sampling && !slot.can_speculate();
+            llama_set_sampler(slot.ctx_tgt, slot.id, backend_sampling ? common_sampler_get(slot.smpl.get()) : nullptr);
+        }
+        SLT_INF(slot, "kv-swap: UNPARKED (priority=%d, %zu still suspended)\n", slot.task->params.priority, suspended.size());
+    }
+
+    // proactive preempt/resume by VRAM watermark; runs at the START of update_slots (safe post-decode boundary)
+    void schedule_kv_swap() {
+        if (kv_swap_reserve_mib < 0) { // one-time env init
+            const char * er = getenv("LLAMA_KV_SWAP_RESERVE_MIB");
+            const char * em = getenv("LLAMA_KV_SWAP_MAX_ACTIVE");
+            kv_swap_reserve_mib = er ? atoi(er) : 0;
+            kv_swap_max_active  = em ? atoi(em) : 0;
+            const char * ed  = getenv("LLAMA_KV_SWAP_DIR");
+            const char * erm = getenv("LLAMA_KV_SWAP_RAM_MIB");
+            kv_swap_dir     = ed ? ed : "";
+            kv_swap_ram_mib = erm ? atoi(erm) : 0;
+            if (kv_swap_reserve_mib > 0 || kv_swap_max_active > 0)
+                SRV_INF("kv-swap scheduler enabled: reserve=%d MiB, max_active=%d\n", kv_swap_reserve_mib, kv_swap_max_active);
+        }
+        if (kv_swap_reserve_mib <= 0 && kv_swap_max_active <= 0) return;
+        const size_t reserve = (size_t) (kv_swap_reserve_mib > 0 ? kv_swap_reserve_mib : 0) * 1024ull * 1024ull;
+
+        // survey park-eligible (GENERATING completion) slots: count, lowest-priority victim, highest active priority
+        server_slot * victim = nullptr; int maxp = 0; int n_active = 0; bool have = false;
+        for (auto & s : slots) {
+            if (!kv_swap_park_eligible(s)) continue;
+            n_active++;
+            const int p = s.task->params.priority;
+            if (!have || p > maxp) { maxp = p; have = true; }
+            if (!victim || p < victim->task->params.priority) victim = &s;
+        }
+
+        const bool over_count = kv_swap_max_active  > 0 && n_active > kv_swap_max_active;
+        const bool over_vram  = kv_swap_reserve_mib > 0 && kv_swap_free_vram() < reserve;
+        // park at most one STRICTLY-lower-priority slot per boundary, never the highest-priority runner;
+        // one action per boundary lets a decode make progress before re-evaluating.
+        if ((over_count || over_vram) && victim && victim->task->params.priority < maxp) {
+            kv_swap_park(*victim);
+            return;
+        }
+
+        // resume the highest-priority parked request when under both caps and a slot is free
+        if (kv_swap_max_active > 0 && n_active >= kv_swap_max_active) return;
+        while (!suspended.empty()) {
+            server_slot * free_slot = nullptr;
+            for (auto & s : slots) { if (!s.is_processing()) { free_slot = &s; break; } }
+            if (!free_slot) break;
+            size_t best = 0;
+            for (size_t i = 1; i < suspended.size(); i++) if (suspended[i].priority > suspended[best].priority) best = i;
+            const size_t need = suspended[best].prompt.data.main.size() + suspended[best].prompt.data.drft.size();
+            if (kv_swap_reserve_mib > 0 && kv_swap_free_vram() < reserve + need) break;
+            server_suspended s = std::move(suspended[best]);
+            suspended.erase(suspended.begin() + best);
+            kv_swap_unpark(std::move(s), *free_slot);
+            if (kv_swap_max_active > 0) break; // resume one per boundary under a count cap
+        }
+    }
+
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -2711,6 +2956,9 @@ private:
 #endif
 
         // check if all slots are idle
+        // KV-swap: proactively park/resume slots by VRAM watermark at this safe post-decode boundary
+        schedule_kv_swap();
+
         {
             bool all_idle = true;
 
