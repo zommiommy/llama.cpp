@@ -1480,6 +1480,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--kv-lazy"},
+        {"--no-kv-lazy"},
+        "reserve KV cache virtual address space and commit VRAM on demand as sequences grow (CUDA VMM); "
+        "peak VRAM tracks actual token usage. no effect on devices without VMM (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_lazy = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LAZY").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

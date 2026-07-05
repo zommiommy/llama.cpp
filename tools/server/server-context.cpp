@@ -3635,6 +3635,13 @@ private:
                 if (ret < -1) {
                     // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
+                    if (params_base.kv_lazy) {
+                        // any ret < -1 is a generic compute failure; under --kv-lazy the most likely cause is
+                        // an on-demand KV/recurrent-state growth OOM. the in-flight slots are reset below and
+                        // the server keeps serving new requests.
+                        err = "Compute error (with --kv-lazy, most likely KV/recurrent-state growth ran out of "
+                              "VRAM; reduce --parallel or context size). See server logs.";
+                    }
                 }
 
                 // TODO: handle ret == 2 (abort) when we start aborting
