@@ -356,6 +356,12 @@ llama_build(test-backend-ops.cpp LINK ggml)
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
+
+# V1: CUDA growable (demand-paged) buffer type. Requires the CUDA backend + its stats symbol.
+if (GGML_CUDA)
+    llama_build_and_test(test-growable-buffer.cpp LINK ggml ggml-cuda)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")

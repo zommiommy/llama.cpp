@@ -840,6 +840,8 @@ ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
     /* .set_tensor_n    = */ NULL,
     /* .get_tensor_n    = */ NULL,
     /* .cpy_tensor_n    = */ NULL,
+    /* .ensure_range    = */ NULL,
+    /* .release_range   = */ NULL,
 };
 
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {

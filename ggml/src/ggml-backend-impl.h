@@ -76,6 +76,12 @@ extern "C" {
         void         (*get_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors,       void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
         // (optional) batched tensor copies: returns true if all copies were performed, false if unsupported and no copies were performed
         bool         (*cpy_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
+        // (optional) ensure the byte range [offset, offset+size) is physically resident; returns false on OOM.
+        // used by demand-paged (growable) buffers to commit pages lazily; NULL means "always resident" (no-op).
+        bool         (*ensure_range) (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+        // (optional) release physical pages of any granule wholly contained in [offset, offset+size).
+        // arbitrary interior range; partial edge granules shared with neighbors stay resident. NULL means no-op.
+        void         (*release_range)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
     };
 
     struct ggml_backend_buffer {
@@ -224,6 +230,10 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) buffer type that reserves virtual address space and commits physical memory on demand
+        // (returns a growable buffer type). NULL if the device does not support demand paging.
+        ggml_backend_buffer_type_t (*get_lazy_buffer_type)(ggml_backend_dev_t dev);
     };
 
     struct ggml_backend_device {
