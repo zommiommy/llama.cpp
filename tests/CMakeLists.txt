@@ -281,6 +281,13 @@ endif()
 llama_build(test-backend-ops.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)
+
+# V1: CUDA growable (demand-paged) buffer type. Requires the CUDA backend + its stats symbol.
+if (GGML_CUDA)
+    llama_build_and_test(test-growable-buffer.cpp)
+    target_link_libraries(test-growable-buffer PRIVATE ggml-cuda)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
