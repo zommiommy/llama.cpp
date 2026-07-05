@@ -25,7 +25,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter,
+                     bool   kv_lazy) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -33,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
+    this->kv_lazy = kv_lazy;
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
@@ -85,6 +87,14 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (offload) {
             auto * dev = model.dev_layer(i);
             buft = ggml_backend_dev_buffer_type(dev);
+
+            if (kv_lazy) {
+                // demand-paged recurrent state: reserve VA now; physical VRAM committed on slot activation.
+                ggml_backend_buffer_type_t buft_lazy = ggml_backend_dev_buffer_type_lazy(dev);
+                if (buft_lazy) {
+                    buft = buft_lazy;
+                }
+            }
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -139,8 +149,14 @@ void llama_memory_recurrent::clear(bool data) {
     used = 0;
 
     if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+        if (kv_lazy) {
+            // cells were just reset -> release all committed recurrent-state pages (re-committed and
+            // zeroed on next use), so an idle recurrent cache drops toward ~0 VRAM.
+            release_empty_cells();
+        } else {
+            for (auto & [_, buf] : ctxs_bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 
@@ -229,7 +245,45 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         head = new_head;
     }
 
+    if (kv_lazy) {
+        // release recurrent-state pages of cells emptied by this removal (idle-slot / eviction reclaim)
+        release_empty_cells();
+    }
+
     return true;
+}
+
+void llama_memory_recurrent::release_empty_cells() {
+    if (!kv_lazy) {
+        return;
+    }
+
+    auto release_row = [&](const ggml_tensor * t, uint32_t row) {
+        if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+            return;
+        }
+        void * base = ggml_backend_buffer_get_base(t->buffer);
+        if (base == nullptr) {
+            return;
+        }
+        const size_t off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) row * t->nb[1];
+        ggml_backend_buffer_release_range(t->buffer, off, t->nb[1]);
+    };
+
+    // release the state rows of every currently-empty cell, across all rollback groups. empty cells
+    // hold no live state and are re-committed (and zeroed) by ensure_state_window before reuse.
+    for (uint32_t c = 0; c < size; ++c) {
+        if (!cells[c].is_empty()) {
+            continue;
+        }
+        for (uint32_t g = 0; g <= n_rs_seq; ++g) {
+            const uint32_t row = g * size + c;
+            for (size_t il = 0; il < r_l.size(); ++il) {
+                release_row(r_l[il], row);
+                release_row(s_l[il], row);
+            }
+        }
+    }
 }
 
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -690,6 +744,72 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // sanity check
     return n >= n_seqs;
+}
+
+bool llama_memory_recurrent::ensure_state_window() {
+    if (!kv_lazy) {
+        return true;
+    }
+
+    // commit the physical pages for the active cell range [head, head+n) that the recurrent graph
+    // reads/writes this decode (see find_slot: cell_id = s + min, head = min, n = max-min+1),
+    // replicated across the (1 + n_rs_seq) rollback groups (row = g*size + cell). idempotent; a
+    // no-op for non-growable buffers (e.g. CPU layers under partial offload).
+    auto ensure_rows = [&](const ggml_tensor * t, uint32_t row0, uint32_t nrows) -> bool {
+        if (t == nullptr || t->buffer == nullptr || t->data == nullptr || nrows == 0) {
+            return true;
+        }
+        void * base = ggml_backend_buffer_get_base(t->buffer);
+        if (base == nullptr) {
+            return true;
+        }
+        const size_t off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) row0 * t->nb[1];
+        return ggml_backend_buffer_ensure_range(t->buffer, off, (size_t) nrows * t->nb[1]);
+    };
+
+    const uint32_t nrows = (head < size) ? std::min(n, size - head) : 0;
+    for (uint32_t g = 0; g <= n_rs_seq; ++g) {
+        const uint32_t row0 = g * size + head;
+        for (size_t il = 0; il < r_l.size(); ++il) {
+            if (!ensure_rows(r_l[il], row0, nrows)) {
+                return false;
+            }
+            if (!ensure_rows(s_l[il], row0, nrows)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool llama_memory_recurrent::find_slot_ensure(const llama_ubatch & ubatch) {
+    if (!kv_lazy) {
+        find_slot(ubatch);
+        return true;
+    }
+
+    // snapshot the metadata that find_slot mutates so a lazy-commit VRAM OOM rolls back cleanly,
+    // leaving the cache consistent for the caller to evict a slot and retry. cheap: `size` is the
+    // number of sequence slots (small, one cell per slot).
+    const auto     cells_bak = cells;
+    const uint32_t head_bak  = head;
+    const uint32_t n_bak     = n;
+    const uint32_t used_bak  = used;
+    const int32_t  rs_z_bak  = rs_z;
+
+    if (!find_slot(ubatch) || !ensure_state_window()) {
+        // roll back to the pre-find_slot state so a failed slot search or a lazy-commit VRAM OOM
+        // leaves the cache consistent for the caller to evict a slot and retry.
+        cells = cells_bak;
+        head  = head_bak;
+        n     = n_bak;
+        used  = used_bak;
+        rs_z  = rs_z_bak;
+        return false;
+    }
+
+    return true;
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -1204,7 +1324,11 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    // find the slot and commit its demand-paged recurrent-state pages atomically; on VRAM OOM the
+    // metadata is rolled back and the decode fails so the caller can evict a slot and retry.
+    if (!mem->find_slot_ensure(ubatches[i_next])) {
+        return false;
+    }
 
     return true;
 }

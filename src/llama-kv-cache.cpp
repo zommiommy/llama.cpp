@@ -77,9 +77,10 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                     bool   kv_lazy) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), kv_lazy(kv_lazy), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -214,6 +215,15 @@ llama_kv_cache::llama_kv_cache(
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
+
+            if (kv_lazy) {
+                // demand-paged KV: reserve virtual address space now; physical VRAM is committed
+                // per graph window in llama_kv_cache_context::apply(). falls back to eager if no VMM.
+                ggml_backend_buffer_type_t buft_lazy = ggml_backend_dev_buffer_type_lazy(dev);
+                if (buft_lazy) {
+                    buft = buft_lazy;
+                }
+            }
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -370,8 +380,14 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+        if (kv_lazy) {
+            // release all committed KV pages (cells were just reset); they are re-committed and
+            // zeroed on next use. cheaper than memset-ing, and lets idle caches drop to ~0 VRAM.
+            release_all();
+        } else {
+            for (auto & [_, buf] : ctxs_bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 }
@@ -439,6 +455,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 head = new_head;
             }
         }
+    }
+
+    if (kv_lazy) {
+        // a sequence was removed -> release the now-unused tail of each stream region
+        release_unused_tail();
     }
 
     return true;
@@ -2552,6 +2573,124 @@ bool llama_kv_cache_context::next() {
     return true;
 }
 
+// ensure the [stream*nb2, +len) byte window of a KV tensor is physically resident.
+// safe for null tensors and non-allocated buffers (dummy / base==null), and a no-op for non-growable buffers.
+static bool kv_lazy_ensure_window(const ggml_tensor * t, uint32_t stream, size_t len) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return true;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return true;
+    }
+    const size_t off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) stream * t->nb[2];
+    return ggml_backend_buffer_ensure_range(t->buffer, off, len);
+}
+
+// release the physical pages of a KV tensor's stream region beyond the highest used cell.
+// safe for null/non-allocated buffers and a no-op for non-growable buffers.
+static void kv_lazy_release_tail(const ggml_tensor * t, uint32_t stream, uint32_t used_cells) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return;
+    }
+    const uint32_t n_cells = (uint32_t) t->ne[1];
+    if (used_cells >= n_cells) {
+        return;
+    }
+    const size_t region_off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) stream * t->nb[2];
+    const size_t tail_off   = region_off + (size_t) used_cells * t->nb[1];
+    const size_t tail_len   = (size_t) (n_cells - used_cells) * t->nb[1];
+    ggml_backend_buffer_release_range(t->buffer, tail_off, tail_len);
+}
+
+bool llama_kv_cache::ensure_kv_window(const slot_info & sinfo) {
+    if (!kv_lazy) {
+        return true;
+    }
+
+    // project the padded graph window [0, n_kv) that apply_ubatch + get_n_kv will produce for this
+    // ubatch, WITHOUT mutating cell metadata, then commit its physical pages. computing it up front
+    // lets apply() commit before mutating the cache, so a VRAM OOM fails the ubatch before any cell
+    // metadata is mutated, and the caller can evict + retry. mirrors get_n_kv()'s padding exactly.
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    uint32_t n_kv_proj = 0;
+    for (uint32_t is = 0; is < sinfo.n_stream(); ++is) {
+        const auto & cells = v_cells[sinfo.strm[is]];
+
+        uint32_t used_max_p1 = cells.used_max_p1();
+        for (uint32_t idx : sinfo.idxs[is]) {
+            used_max_p1 = std::max(used_max_p1, idx + 1);
+        }
+
+        const uint32_t n_kv_s = std::min<uint32_t>(cells.size(), std::max(n_pad_cur, GGML_PAD(used_max_p1, n_pad_cur)));
+        n_kv_proj = std::max(n_kv_proj, n_kv_s);
+    }
+
+    // ggml_backend_buffer_ensure_range is a no-op for any layer whose buffer is not growable
+    // (e.g. CPU layers under partial offload), so this is safe to call for every layer/stream.
+    for (const auto & layer : layers) {
+        for (uint32_t is = 0; is < sinfo.n_stream(); ++is) {
+            const uint32_t s = sinfo.strm[is];
+
+            if (layer.k && !kv_lazy_ensure_window(layer.k, s, (size_t) n_kv_proj * layer.k->nb[1])) {
+                return false;
+            }
+
+            if (layer.v) {
+                // non-transposed V (flash-attn): cells are contiguous rows -> commit exactly [0, n_kv_proj).
+                // transposed V (no flash-attn): a cell spans one column across all rows -> commit the full
+                // per-stream region (correct, just less lazy).
+                const size_t len = v_trans ? layer.v->nb[2] : (size_t) n_kv_proj * layer.v->nb[1];
+                if (!kv_lazy_ensure_window(layer.v, s, len)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+void llama_kv_cache::release_unused_tail() {
+    if (!kv_lazy) {
+        return;
+    }
+
+    // release, per stream, the region beyond the highest used cell. these cells hold no live data
+    // and are re-committed (and zeroed) by ensure_kv_window before any future use, so this is safe.
+    for (const auto & layer : layers) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const uint32_t used = v_cells[s].used_max_p1();
+            kv_lazy_release_tail(layer.k, s, used);
+            // transposed V stores cells strided across columns, so a contiguous byte tail does not
+            // map to unused cells -> only release V for the non-transposed (flash-attn) layout.
+            if (!v_trans) {
+                kv_lazy_release_tail(layer.v, s, used);
+            }
+        }
+    }
+}
+
+void llama_kv_cache::release_all() {
+    if (!kv_lazy) {
+        return;
+    }
+
+    // release the entire committed region of every K/V stream. only safe when the cache is empty
+    // (see clear()): the whole region is unused, so transposed V can be released too.
+    for (const auto & layer : layers) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            kv_lazy_release_tail(layer.k, s, 0);
+            kv_lazy_release_tail(layer.v, s, 0);
+        }
+    }
+}
+
 bool llama_kv_cache_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
@@ -2560,6 +2699,13 @@ bool llama_kv_cache_context::apply() {
         kv->update(lctx, do_shift, sc_info);
 
         return true;
+    }
+
+    // commit the demand-paged KV pages this graph window will touch BEFORE mutating cell metadata,
+    // so a VRAM OOM fails this ubatch before mutating cell metadata (metadata unchanged for the
+    // failing ubatch) and the caller can evict + retry.
+    if (!kv->ensure_kv_window(sinfos[i_cur])) {
+        return false;
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);

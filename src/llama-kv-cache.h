@@ -112,7 +112,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                         bool   kv_lazy = false);
 
     ~llama_kv_cache() = default;
 
@@ -198,6 +199,18 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // demand-paged (lazy) KV: commit the physical pages that the current graph window [0, n_kv) will
+    // read/write, for each active stream and layer. no-op unless kv_lazy. returns false on VRAM OOM.
+    bool ensure_kv_window(const slot_info & sinfo);
+
+    // demand-paged (lazy) KV: release the physical pages of each stream region beyond its highest
+    // used cell (granule-aligned). no-op unless kv_lazy. call after cells are freed (seq_rm / clear).
+    void release_unused_tail();
+
+    // demand-paged (lazy) KV: release the entire committed region of every stream. used by clear()
+    // when the cache is emptied (safe for transposed V: the whole region is unused). no-op unless kv_lazy.
+    void release_all();
+
     //
     // input API
     //
@@ -239,6 +252,9 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    // reserve KV virtual address space and commit physical VRAM on demand (CUDA VMM growable buffers)
+    const bool     kv_lazy   = false;
 
     // required padding
     const uint32_t n_pad = 1;

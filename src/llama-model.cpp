@@ -2113,6 +2113,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 llama_kv_cache::layer_filter_cb filter_idx =
                     [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
 
+                if (cparams.kv_lazy) {
+                    LLAMA_LOG_WARN("%s: --kv-lazy is not supported for DEEPSEEK32 (MSA) cache; using eager KV allocation\n", __func__);
+                }
                 res = new llama_kv_cache_msa(
                         *this,
                         params.type_k,
@@ -2273,7 +2276,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
-                            nullptr);
+                            nullptr,
+                            cparams.kv_lazy);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
@@ -2300,6 +2304,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
+                        if (cparams.kv_lazy) {
+                            LLAMA_LOG_WARN("%s: --kv-lazy is not supported for hybrid+SWA cache; using eager KV allocation\n", __func__);
+                        }
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -2336,7 +2343,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_lazy           */ cparams.kv_lazy);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2371,6 +2379,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
+
+                        if (cparams.kv_lazy) {
+                            LLAMA_LOG_WARN("%s: --kv-lazy is not supported for SWA (iSWA) cache; using eager KV allocation\n", __func__);
+                        }
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
@@ -2438,7 +2450,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                cparams.kv_lazy);
                     }
                 }
             }
