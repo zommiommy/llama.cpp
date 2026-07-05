@@ -24,7 +24,8 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+                         bool   kv_lazy = false);
 
     ~llama_memory_recurrent() = default;
 
@@ -59,6 +60,18 @@ public:
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 
+    // demand-paged (lazy) recurrent state: commit the physical pages for the active cell range
+    // [head, head+n) across all rollback groups. no-op unless kv_lazy. returns false on VRAM OOM.
+    bool ensure_state_window();
+
+    // find a slot for the ubatch and commit its lazy recurrent-state pages atomically: on a VRAM OOM
+    // the metadata find_slot mutated is rolled back, so the caller can evict + retry. false on OOM.
+    bool find_slot_ensure(const llama_ubatch & ubatch);
+
+    // demand-paged (lazy) recurrent state: release the state rows of cells that are currently empty
+    // (across rollback groups). no-op unless kv_lazy. called after cells are freed (seq_rm / clear).
+    void release_empty_cells();
+
     bool get_can_shift() const override;
 
     // state write/load
@@ -72,6 +85,9 @@ public:
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
+
+    // reserve recurrent-state virtual address space and commit physical VRAM on demand (CUDA VMM growable buffers)
+    bool kv_lazy = false;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
