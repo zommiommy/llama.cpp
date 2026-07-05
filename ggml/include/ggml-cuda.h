@@ -27,6 +27,16 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// demand-paged (growable) device buffer type: reserves virtual address space up front and
+// commits physical VRAM on demand as tensors are written. Returns NULL if the device does
+// not support CUDA VMM (in which case callers should fall back to ggml_backend_cuda_buffer_type).
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_growable_buffer_type(int device);
+
+// query commit statistics of a buffer allocated from ggml_backend_cuda_growable_buffer_type.
+// any out pointer may be NULL. for a non-growable buffer, reports reserved==committed==size, ops==0.
+GGML_BACKEND_API void ggml_backend_cuda_buffer_stats(ggml_backend_buffer_t buffer,
+        size_t * reserved, size_t * committed, size_t * commit_ops, size_t * release_ops);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

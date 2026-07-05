@@ -193,6 +193,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
+    /* .get_lazy_buffer_type = */ NULL,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -1496,6 +1497,8 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
+    /* .ensure_range   = */ NULL,
+    /* .release_range  = */ NULL,
 };
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {

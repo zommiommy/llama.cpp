@@ -278,6 +278,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# V1: CUDA growable (demand-paged) buffer type. Requires the CUDA backend + its stats symbol.
+if (GGML_CUDA)
+    llama_build_and_test(test-growable-buffer.cpp)
+    target_link_libraries(test-growable-buffer PRIVATE ggml-cuda)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
