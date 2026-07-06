@@ -143,6 +143,12 @@ struct llama_memory_i {
     // cannot page-share. lets a caller decide whether a cross-sequence borrow would beat its own prefix reuse.
     virtual llama_pos seq_share_align() const { return 0; }
 
+    // logical bytes to store ONE token's attention KV (K+V across all cached layers; row size only, independent
+    // of paging). 0 if this memory has no attention KV (pure recurrent).
+    virtual size_t kv_size_per_token() const { return 0; }
+    // bytes of the recurrent/SSM state for ONE sequence (fixed; does not grow with tokens). 0 if not recurrent.
+    virtual size_t rs_state_size() const { return 0; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //
