@@ -116,6 +116,33 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // --- page-granular eviction (partial KV reclaim to host RAM) ---
+    // evict up to `max_bytes` of seq_id's committed KV to host RAM in chunks of `chunk_bytes`; returns bytes freed.
+    // keeps the sequence's cells/metadata intact (unlike seq_rm) so seq_restore brings it back byte-identically.
+    // default no-op: only demand-paged KV caches implement this.
+    virtual size_t seq_evict  (llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes) {
+        (void) seq_id; (void) max_bytes; (void) chunk_bytes;
+        return 0;
+    }
+    // restore all pages of seq_id previously evicted by seq_evict; returns false on device OOM.
+    virtual bool   seq_restore(llama_seq_id seq_id) {
+        (void) seq_id;
+        return true;
+    }
+
+    // --- read-only prefix page sharing (system-prompt reuse across sequences) ---
+    // map the leading `n_tokens` of `src`'s KV pages into `dst`'s per-stream region READ-ONLY (no copy, no extra
+    // VRAM), marking dst's prefix cells present. returns tokens actually shared (0 = caller must process the
+    // prefix normally). default no-op: only demand-paged, per-stream (--kv-share) KV caches implement this.
+    virtual llama_pos seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased = nullptr) {
+        (void) dst; (void) src; (void) n_tokens;
+        if (out_aliased) { *out_aliased = 0; }
+        return 0;
+    }
+    // the cell-count quantum a shared prefix snaps to (a share is always a whole multiple), or 0 if this memory
+    // cannot page-share. lets a caller decide whether a cross-sequence borrow would beat its own prefix reuse.
+    virtual llama_pos seq_share_align() const { return 0; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

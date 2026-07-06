@@ -37,6 +37,11 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_growable_buffer_ty
 GGML_BACKEND_API void ggml_backend_cuda_buffer_stats(ggml_backend_buffer_t buffer,
         size_t * reserved, size_t * committed, size_t * commit_ops, size_t * release_ops);
 
+// query eviction statistics of a growable buffer (partial KV reclaim to host RAM).
+// any out pointer may be NULL. for a non-growable buffer, reports all zero.
+GGML_BACKEND_API void ggml_backend_cuda_buffer_evict_stats(ggml_backend_buffer_t buffer,
+        size_t * host_bytes, size_t * evict_ops, size_t * restore_ops);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 
