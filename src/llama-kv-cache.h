@@ -148,6 +148,7 @@ public:
     // read-only page sharing of a system-prompt prefix from `src` into `dst` (see llama_memory_i::seq_share_prefix).
     llama_pos seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased = nullptr) override;
     llama_pos seq_share_align() const override;
+    size_t kv_size_per_token() const override { return n_bytes_per_token; }
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
@@ -274,6 +275,8 @@ private:
     // true when the cache was padded so a shared prefix can be page-aliased (read-only, zero-copy); false =>
     // copy-only sharing (byte-copy the prefix into the borrower's private pages, no VRAM saving). set in ctor B0.
     bool           kv_share_can_alias = false;
+    // logical KV bytes to store one token (K+V over all cached layers; row size, no paging/pad). set in ctor.
+    size_t         n_bytes_per_token = 0;
 
     // required padding
     const uint32_t n_pad = 1;

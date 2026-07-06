@@ -198,6 +198,14 @@ llama_pos llama_memory_hybrid::seq_share_align() const {
     return mem_attn->seq_share_align();
 }
 
+size_t llama_memory_hybrid::kv_size_per_token() const {
+    return mem_attn->kv_size_per_token();
+}
+
+size_t llama_memory_hybrid::rs_state_size() const {
+    return mem_recr->rs_state_size();
+}
+
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
     // the min of the total cache is the max of the two caches' min values
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));

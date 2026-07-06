@@ -774,6 +774,11 @@ extern "C" {
     // the cell-count quantum a shared prefix snaps to (whole multiple), or 0 if this memory cannot page-share.
     LLAMA_API llama_pos llama_memory_seq_share_align(llama_memory_t mem);
 
+    // logical bytes to store one token's attention KV (K+V across all cached layers); 0 if no attention KV.
+    LLAMA_API size_t llama_memory_kv_size_per_token(llama_memory_t mem);
+    // bytes of the recurrent/SSM state for one sequence (fixed); 0 if not a recurrent/hybrid memory.
+    LLAMA_API size_t llama_memory_rs_state_size(llama_memory_t mem);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
