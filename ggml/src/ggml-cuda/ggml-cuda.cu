@@ -874,6 +874,10 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .reset           = */ NULL,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range     = */ NULL,
+    /* .restore_range   = */ NULL,
+    /* .share_range     = */ NULL,
+    /* .copy_range      = */ NULL,
 };
 
 // cuda buffer type
@@ -977,6 +981,15 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 // KV layout are byte-identical to a normal cuda buffer; only the physical backing is lazy.
 #if defined(GGML_USE_VMM)
 
+// one contiguous pinned host buffer holding the evicted (copied-out) contents of a run of granules.
+// tracked by the growable buffer's chunk_of[] page table; see ggml_backend_cuda_growable_evict.
+struct ggml_backend_cuda_evict_chunk {
+    size_t g0;      // first granule of the chunk
+    size_t n_gran;  // granules spanned (host buffer = n_gran * granularity bytes)
+    void * host;    // pinned host allocation (cudaMallocHost)
+    size_t n_live;  // granules still pointing here via chunk_of; the host buffer is freed when this hits 0
+};
+
 struct ggml_backend_cuda_growable_buffer_context {
     // NOTE: `device` MUST remain the first member so that the device-only casts to
     // ggml_backend_cuda_buffer_context in the copy paths (cpy_tensor / cpy_tensor_async) read it correctly.
@@ -988,14 +1001,129 @@ struct ggml_backend_cuda_growable_buffer_context {
     uint64_t    committed   = 0;   // bytes physically committed
     uint64_t    commit_ops  = 0;   // number of granules committed over the buffer's lifetime
     uint64_t    release_ops = 0;   // number of granules released over the buffer's lifetime
+    // --- page-granular eviction (partial KV reclaim) ---
+    // chunk_of[g] = index into `chunks` of the chunk owning evicted granule g, or -1 if not evicted.
+    // this IS the eviction page table: chunk_of[g] != -1 is the "evicted" flag, and the host source of
+    // granule g is chunks[chunk_of[g]].host + (g - chunks[chunk_of[g]].g0) * granularity.
+    std::vector<int32_t>                       chunk_of;
+    std::vector<ggml_backend_cuda_evict_chunk> chunks;   // live evicted chunks (swap-pop erased)
+    // --- read-only page sharing (system-prompt prefix reuse) ---
+    // borrowed[g] = granule g maps another (owner) granule's physical page read-only; not owned, not committed.
+    // the owner's mapping keeps the physical page alive; unmapping a borrowed granule never frees it.
+    std::vector<bool>                          borrowed;
+    uint64_t    host_bytes  = 0;   // pinned host bytes currently holding evicted content
+    uint64_t    evict_ops   = 0;   // number of evict chunks created over the buffer's lifetime
+    uint64_t    restore_ops = 0;   // number of granules restored over the buffer's lifetime
     std::string name;
 
     ggml_backend_cuda_growable_buffer_context(int device, CUdeviceptr base, size_t reserved, size_t granularity) :
         device(device), base(base), reserved(reserved), granularity(granularity),
         mapped(granularity ? reserved / granularity : 0, false),
+        chunk_of(granularity ? reserved / granularity : 0, -1),
+        borrowed(granularity ? reserved / granularity : 0, false),
         name(GGML_CUDA_NAME + std::to_string(device) + " (lazy)") {
     }
 };
+
+// commit (map) one granule; updates mapped/committed/commit_ops. zero-fills iff `zero` (async, no sync here;
+// the caller syncs). returns false on device OOM (maps nothing, touches no state).
+static bool ggml_backend_cuda_growable_commit_granule(ggml_backend_cuda_growable_buffer_context * ctx, size_t g, bool zero) {
+    const size_t gran = ctx->granularity;
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = ctx->device;
+    CUmemGenericAllocationHandle handle;
+    CUresult err = cuMemCreate(&handle, gran, &prop, 0);
+    if (err == CUDA_ERROR_OUT_OF_MEMORY) {
+        return false;
+    }
+    CU_CHECK(err);
+    const CUdeviceptr ptr = ctx->base + (CUdeviceptr) (g * gran);
+    CU_CHECK(cuMemMap(ptr, gran, 0, handle, 0));
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id   = ctx->device;
+    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CU_CHECK(cuMemSetAccess(ptr, gran, &access, 1));
+    // the mapping keeps the physical allocation alive; cuMemUnmap alone frees it later.
+    CU_CHECK(cuMemRelease(handle));
+    if (zero) {
+        // zero newly committed pages so padded / out-of-range KV never reads as NaN
+        CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, gran, cudaStreamPerThread));
+    }
+    ctx->mapped[g]  = true;
+    ctx->committed += gran;
+    ctx->commit_ops++;
+    return true;
+}
+
+// free chunk ci's host buffer and swap-pop it out of `chunks`, re-pointing the moved tail chunk's page-table
+// entries. callers must first clear chunk_of for ci's granules (restore) or ensure none remain (release).
+static void ggml_backend_cuda_growable_erase_chunk(ggml_backend_cuda_growable_buffer_context * ctx, int32_t ci) {
+    const size_t gran = ctx->granularity;
+    CUDA_CHECK(cudaFreeHost(ctx->chunks[ci].host));
+    ctx->host_bytes -= ctx->chunks[ci].n_gran * gran;
+    const int32_t last = (int32_t) ctx->chunks.size() - 1;
+    if (ci != last) {
+        ctx->chunks[ci] = ctx->chunks[last];
+        const ggml_backend_cuda_evict_chunk m = ctx->chunks[ci];
+        for (size_t gg = m.g0; gg < m.g0 + m.n_gran; ++gg) {
+            if (ctx->chunk_of[gg] == last) {
+                ctx->chunk_of[gg] = ci;
+            }
+        }
+    }
+    ctx->chunks.pop_back();
+}
+
+// restore evicted chunk `ci`: re-map its granules, copy contents back from host (no zeroing), free the host
+// buffer, and swap-pop the chunk out of `chunks`. returns false on device OOM (chunk left intact/restorable).
+static bool ggml_backend_cuda_growable_restore_chunk(ggml_backend_cuda_growable_buffer_context * ctx, int32_t ci) {
+    const size_t gran = ctx->granularity;
+    const ggml_backend_cuda_evict_chunk c = ctx->chunks[ci]; // by value: swap-pop below mutates chunks
+    ggml_cuda_set_device(ctx->device);
+    const size_t gend = c.g0 + c.n_gran;
+    std::vector<size_t> committed_here;
+    // pass 1: re-map every resident granule of the chunk; roll back this call's commits on OOM.
+    for (size_t g = c.g0; g < gend; ++g) {
+        if (ctx->chunk_of[g] != ci) {
+            continue;
+        }
+        if (!ggml_backend_cuda_growable_commit_granule(ctx, g, /*zero=*/false)) {
+            for (size_t gg : committed_here) {
+                CU_CHECK(cuMemUnmap(ctx->base + (CUdeviceptr) (gg * gran), gran));
+                ctx->mapped[gg] = false;
+                ctx->committed -= gran;
+            }
+            return false;
+        }
+        committed_here.push_back(g);
+    }
+    // pass 2: coalesce H2D copies over contiguous committed runs
+    for (size_t i = 0; i < committed_here.size(); ) {
+        const size_t run0 = committed_here[i];
+        size_t j = i;
+        while (j + 1 < committed_here.size() && committed_here[j + 1] == committed_here[j] + 1) {
+            ++j;
+        }
+        const size_t run_len = committed_here[j] - run0 + 1;
+        CUDA_CHECK(cudaMemcpyAsync(
+            (void *) (ctx->base + (CUdeviceptr) (run0 * gran)),
+            (const char *) c.host + (run0 - c.g0) * gran,
+            run_len * gran, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        i = j + 1;
+    }
+    if (!committed_here.empty()) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+    for (size_t gg : committed_here) {
+        ctx->chunk_of[gg] = -1;
+        ctx->restore_ops++;
+    }
+    ggml_backend_cuda_growable_erase_chunk(ctx, ci);
+    return true;
+}
 
 // commit every granule overlapping [offset, offset+size); returns false on device OOM.
 static bool ggml_backend_cuda_growable_ensure(ggml_backend_cuda_growable_buffer_context * ctx, size_t offset, size_t size) {
@@ -1015,35 +1143,23 @@ static bool ggml_backend_cuda_growable_ensure(ggml_backend_cuda_growable_buffer_
         if (ctx->mapped[g]) {
             continue;
         }
-        CUmemAllocationProp prop = {};
-        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id   = ctx->device;
-        CUmemGenericAllocationHandle handle;
-        CUresult err = cuMemCreate(&handle, gran, &prop, 0);
-        if (err == CUDA_ERROR_OUT_OF_MEMORY) {
+        if (ctx->chunk_of[g] != -1) {
+            // faulting an evicted page: restore its whole chunk (copies contents back), never zero it
+            if (!ggml_backend_cuda_growable_restore_chunk(ctx, ctx->chunk_of[g])) {
+                if (committed_any) {
+                    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+                }
+                return false;
+            }
+            committed_any = true;
+            continue;
+        }
+        if (!ggml_backend_cuda_growable_commit_granule(ctx, g, /*zero=*/true)) {
             if (committed_any) {
                 CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
             }
             return false;
         }
-        CU_CHECK(err);
-        const CUdeviceptr ptr = ctx->base + (CUdeviceptr) (g * gran);
-        CU_CHECK(cuMemMap(ptr, gran, 0, handle, 0));
-        CUmemAccessDesc access = {};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id   = ctx->device;
-        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CU_CHECK(cuMemSetAccess(ptr, gran, &access, 1));
-        // the creation handle is no longer needed once mapped; the mapping keeps the physical
-        // allocation alive and cuMemUnmap alone frees it (same pattern as ggml_cuda_pool_vmm).
-        CU_CHECK(cuMemRelease(handle));
-        // zero newly committed pages so padded / out-of-range KV cells never read as NaN
-        // (replaces the one-time whole-buffer clear done for non-lazy KV buffers at startup).
-        CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, gran, cudaStreamPerThread));
-        ctx->mapped[g]  = true;
-        ctx->committed += gran;
-        ctx->commit_ops++;
         committed_any = true;
     }
     if (committed_any) {
@@ -1063,6 +1179,11 @@ static void ggml_backend_cuda_growable_buffer_free_buffer(ggml_backend_buffer_t 
             }
         }
         CU_CHECK(cuMemAddressFree(ctx->base, ctx->reserved));
+    }
+    for (const ggml_backend_cuda_evict_chunk & c : ctx->chunks) {
+        if (c.host) {
+            CUDA_CHECK(cudaFreeHost(c.host));
+        }
     }
     delete ctx;
 }
@@ -1146,7 +1267,7 @@ static void ggml_backend_cuda_growable_buffer_clear(ggml_backend_buffer_t buffer
     ggml_cuda_set_device(ctx->device);
     bool any = false;
     for (size_t g = 0; g < ctx->mapped.size(); ++g) {
-        if (ctx->mapped[g]) {
+        if (ctx->mapped[g] && !ctx->borrowed[g]) {  // never memset a read-only shared alias (owner's data)
             CUDA_CHECK(cudaMemsetAsync((void *) (ctx->base + (CUdeviceptr) (g * ctx->granularity)), value, ctx->granularity, cudaStreamPerThread));
             any = true;
         }
@@ -1178,13 +1299,245 @@ static void ggml_backend_cuda_growable_buffer_release_range(ggml_backend_buffer_
     }
     ggml_cuda_set_device(ctx->device);
     for (size_t g = g0; g < g1; ++g) {
-        if (ctx->mapped[g]) {
+        if (ctx->borrowed[g]) {
+            // drop a read-only shared alias; the owner's mapping keeps the physical page alive (no committed change)
+            CU_CHECK(cuMemUnmap(ctx->base + (CUdeviceptr) (g * gran), gran));
+            ctx->mapped[g]   = false;
+            ctx->borrowed[g] = false;
+        } else if (ctx->mapped[g]) {
             CU_CHECK(cuMemUnmap(ctx->base + (CUdeviceptr) (g * gran), gran));
             ctx->mapped[g]  = false;
             ctx->committed -= gran;
             ctx->release_ops++;
+        } else if (ctx->chunk_of[g] != -1) {
+            // discard (not restore) an evicted granule: clear its page-table entry so it can never fault stale
+            // KV back in, and free the owning chunk's host buffer once no granule references it (straddle-safe).
+            const int32_t ci = ctx->chunk_of[g];
+            ctx->chunk_of[g] = -1;
+            if (--ctx->chunks[ci].n_live == 0) {
+                ggml_backend_cuda_growable_erase_chunk(ctx, ci);
+            }
         }
     }
+}
+
+// evict granules wholly contained in [offset, offset+size) to pinned host RAM in chunk_gran-granule chunks.
+// returns bytes freed. cross-stream safe: shared edge granules are never wholly contained, so never evicted.
+static size_t ggml_backend_cuda_growable_evict(ggml_backend_cuda_growable_buffer_context * ctx, size_t offset, size_t size, size_t chunk_gran, size_t max_bytes) {
+    if (size == 0 || ctx->granularity == 0 || chunk_gran == 0) {
+        return 0;
+    }
+    const size_t gran = ctx->granularity;
+    size_t end = offset + size;
+    if (end > ctx->reserved) {
+        end = ctx->reserved;
+    }
+    const size_t g0 = (offset + gran - 1) / gran; // first granule fully inside
+    const size_t g1 = end / gran;                 // exclusive: last granule fully inside
+    if (g0 >= g1) {
+        return 0;
+    }
+    ggml_cuda_set_device(ctx->device);
+    size_t bytes_freed = 0;
+    // walk chunk_gran windows anchored at g0 so repeated evicts of the same region revisit identical windows
+    for (size_t cg0 = g0; cg0 < g1; cg0 += chunk_gran) {
+        const size_t cg1 = std::min(cg0 + chunk_gran, g1);
+        // skip a window with no currently-mapped granule (already-evicted are unmapped, holes never mapped):
+        // this is the idempotency + never-overwrite guard for repeated reclaim on the same region.
+        bool any_mapped = false;
+        for (size_t g = cg0; g < cg1; ++g) {
+            if (ctx->mapped[g] && !ctx->borrowed[g]) { any_mapped = true; break; }  // never evict a shared alias
+        }
+        if (!any_mapped) {
+            continue;
+        }
+        void * host = nullptr;
+        if (cudaMallocHost(&host, (cg1 - cg0) * gran) != cudaSuccess || host == nullptr) {
+            // host OOM is soft: leave the window resident; the scheduler falls back to whole-seq park
+            (void) cudaGetLastError();
+            continue;
+        }
+        const int32_t ci = (int32_t) ctx->chunks.size();
+        // coalesce D2H copies over contiguous mapped runs
+        for (size_t g = cg0; g < cg1; ) {
+            if (!ctx->mapped[g] || ctx->borrowed[g]) { ++g; continue; }
+            const size_t run0 = g;
+            while (g < cg1 && ctx->mapped[g] && !ctx->borrowed[g]) { ++g; }
+            const size_t run_len = g - run0;
+            CUDA_CHECK(cudaMemcpyAsync(
+                (char *) host + (run0 - cg0) * gran,
+                (const void *) (ctx->base + (CUdeviceptr) (run0 * gran)),
+                run_len * gran, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        // unmap copied granules and record them in the chunk page table
+        size_t n_live = 0;
+        for (size_t g = cg0; g < cg1; ++g) {
+            if (!ctx->mapped[g] || ctx->borrowed[g]) {
+                continue;
+            }
+            CU_CHECK(cuMemUnmap(ctx->base + (CUdeviceptr) (g * gran), gran));
+            ctx->mapped[g]   = false;
+            ctx->chunk_of[g] = ci;
+            ctx->committed  -= gran;
+            bytes_freed     += gran;
+            n_live++;
+        }
+        ctx->chunks.push_back({ cg0, cg1 - cg0, host, n_live });
+        ctx->host_bytes += (cg1 - cg0) * gran;
+        ctx->evict_ops++;
+        if (bytes_freed >= max_bytes) {
+            break;  // stop after freeing enough NEWLY-evicted pages; already-evicted windows above were skipped
+        }
+    }
+    return bytes_freed;
+}
+
+// restore any evicted granules wholly contained in [offset, offset+size). returns false on device OOM.
+static bool ggml_backend_cuda_growable_restore_range(ggml_backend_cuda_growable_buffer_context * ctx, size_t offset, size_t size) {
+    if (size == 0 || ctx->granularity == 0) {
+        return true;
+    }
+    const size_t gran = ctx->granularity;
+    size_t end = offset + size;
+    if (end > ctx->reserved) {
+        end = ctx->reserved;
+    }
+    const size_t g0 = (offset + gran - 1) / gran;
+    const size_t g1 = end / gran;
+    for (size_t g = g0; g < g1; ++g) {
+        if (ctx->chunk_of[g] != -1) {
+            // restore_chunk clears chunk_of across the whole owning chunk, so its granules self-skip here
+            if (!ggml_backend_cuda_growable_restore_chunk(ctx, ctx->chunk_of[g])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// map the owner's physical pages of granule-aligned [src_off, +size) into [dst_off, +size) READ-ONLY, so both
+// regions alias the same VRAM (system-prompt prefix reuse). ALL-OR-NOTHING: returns `size` (every granule shared)
+// or 0 (nothing shared), never a partial window -> the caller's rollback only ever releases fully-borrowed windows.
+// dst granules must be free; src granules must be owner-resident (mapped, not evicted, not themselves borrowed).
+static size_t ggml_backend_cuda_growable_share(ggml_backend_cuda_growable_buffer_context * ctx,
+        size_t dst_off, size_t src_off, size_t size) {
+    if (size == 0 || ctx->granularity == 0) {
+        return 0;
+    }
+    const size_t gran = ctx->granularity;
+    if (dst_off % gran != 0 || src_off % gran != 0 || size % gran != 0) {  // whole-granule sharing only
+        return 0;
+    }
+    const size_t n = size / gran;
+    // pre-check every granule before mapping any, so a partial failure never leaves a half-borrowed window.
+    for (size_t i = 0; i < n; ++i) {
+        const size_t sg = src_off / gran + i;
+        const size_t dg = dst_off / gran + i;
+        if (sg >= ctx->mapped.size() || dg >= ctx->mapped.size()) {
+            return 0;
+        }
+        if (!ctx->mapped[sg] || ctx->borrowed[sg] || ctx->chunk_of[sg] != -1) {
+            return 0;  // src is not an owner-resident page
+        }
+        if (ctx->mapped[dg] || ctx->borrowed[dg] || ctx->chunk_of[dg] != -1) {
+            return 0;  // dst must be free: not backed, not already borrowed, not holding an evicted shadow
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id   = ctx->device;
+    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READ;  // read-only: any write to a shared page faults loudly
+    size_t shared = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t sg = src_off / gran + i;
+        const size_t dg = dst_off / gran + i;
+        CUmemGenericAllocationHandle h;
+        if (cuMemRetainAllocationHandle(&h, (void *) (ctx->base + (CUdeviceptr) (sg * gran))) != CUDA_SUCCESS) {
+            // unexpected after pre-check: undo this call's mappings and share nothing (stay all-or-nothing)
+            for (size_t k = 0; k < i; ++k) {
+                const size_t dgk = dst_off / gran + k;
+                CU_CHECK(cuMemUnmap(ctx->base + (CUdeviceptr) (dgk * gran), gran));
+                ctx->mapped[dgk]   = false;
+                ctx->borrowed[dgk] = false;
+            }
+            return 0;
+        }
+        const CUdeviceptr dptr = ctx->base + (CUdeviceptr) (dg * gran);
+        CU_CHECK(cuMemMap(dptr, gran, 0, h, 0));
+        CU_CHECK(cuMemSetAccess(dptr, gran, &access, 1));
+        CU_CHECK(cuMemRelease(h));  // the new mapping (and the owner's) keep the physical page alive
+        ctx->mapped[dg]   = true;
+        ctx->borrowed[dg] = true;
+        shared += gran;
+    }
+    return shared;
+}
+
+// device-to-device byte copy of `size` bytes from src_off to dst_off within the same growable buffer.
+// ensures both endpoints resident (src may be owner data, restored if evicted; dst pages committed here),
+// then a synchronous D2D memcpy. no alignment requirement (unlike share). used for the sub-quantum KV
+// prefix remainder copied into a borrower's private pages.
+static size_t ggml_backend_cuda_growable_copy(ggml_backend_cuda_growable_buffer_context * ctx,
+        size_t dst_off, size_t src_off, size_t size) {
+    if (size == 0 || ctx->granularity == 0) {
+        return 0;
+    }
+    // out-of-range guard: ensure() clamps end to ctx->reserved, but the memcpy below uses the full `size`,
+    // so a caller past the reserved VA would get ensure=true then copy OOB. reject first (overflow-safe).
+    if (src_off > ctx->reserved || dst_off > ctx->reserved ||
+        size > ctx->reserved - src_off || size > ctx->reserved - dst_off) {
+        return 0;
+    }
+    // refuse to write INTO a read-only borrowed alias (would fault): real callers copy into disjoint private
+    // cells, so this only guards misuse. reject if any granule overlapping the dst range is borrowed.
+    for (size_t g = dst_off / ctx->granularity; g <= (dst_off + size - 1) / ctx->granularity; ++g) {
+        if (g < ctx->borrowed.size() && ctx->borrowed[g]) {
+            return 0;
+        }
+    }
+    if (!ggml_backend_cuda_growable_ensure(ctx, src_off, size)) {
+        return 0;
+    }
+    if (!ggml_backend_cuda_growable_ensure(ctx, dst_off, size)) {
+        return 0;
+    }
+    ggml_cuda_set_device(ctx->device);
+    // driver-API D2D: the growable buffer is VMM memory (cuMemMap); cuMemcpyDtoDAsync operates on the reserved
+    // VA range directly (transparent across physical granules) and matches the driver-side allocation.
+    CU_CHECK(cuMemcpyDtoDAsync(ctx->base + (CUdeviceptr) dst_off,
+                               ctx->base + (CUdeviceptr) src_off,
+                               size, CU_STREAM_PER_THREAD));
+    CU_CHECK(cuStreamSynchronize(CU_STREAM_PER_THREAD));
+    return size;
+}
+
+static size_t ggml_backend_cuda_growable_buffer_evict_range(ggml_backend_buffer_t buffer, size_t offset, size_t size, size_t chunk_bytes, size_t max_bytes) {
+    ggml_backend_cuda_growable_buffer_context * ctx = (ggml_backend_cuda_growable_buffer_context *) buffer->context;
+    if (ctx->granularity == 0) {
+        return 0;
+    }
+    // chunk_bytes is a whole multiple of the granularity (validated at the server); round defensively.
+    const size_t chunk_gran = std::max<size_t>(1, chunk_bytes / ctx->granularity);
+    return ggml_backend_cuda_growable_evict(ctx, offset, size, chunk_gran, max_bytes);
+}
+
+static bool ggml_backend_cuda_growable_buffer_restore_range(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    return ggml_backend_cuda_growable_restore_range((ggml_backend_cuda_growable_buffer_context *) buffer->context, offset, size);
+}
+
+static size_t ggml_backend_cuda_growable_buffer_share_range(ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size) {
+    return ggml_backend_cuda_growable_share((ggml_backend_cuda_growable_buffer_context *) buffer->context, dst_off, src_off, size);
+}
+
+static size_t ggml_backend_cuda_growable_buffer_copy_range(ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size) {
+    // reject ranges outside the buffer's LOGICAL size (the VMM reservation is granule-rounded and larger).
+    if (size == 0 || src_off > buffer->size || dst_off > buffer->size ||
+        size > buffer->size - src_off || size > buffer->size - dst_off) {
+        return 0;
+    }
+    return ggml_backend_cuda_growable_copy((ggml_backend_cuda_growable_buffer_context *) buffer->context, dst_off, src_off, size);
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_growable_buffer_interface = {
@@ -1201,6 +1554,10 @@ static const ggml_backend_buffer_i ggml_backend_cuda_growable_buffer_interface =
     /* .reset           = */ NULL,
     /* .ensure_range    = */ ggml_backend_cuda_growable_buffer_ensure_range,
     /* .release_range   = */ ggml_backend_cuda_growable_buffer_release_range,
+    /* .evict_range     = */ ggml_backend_cuda_growable_buffer_evict_range,
+    /* .restore_range   = */ ggml_backend_cuda_growable_buffer_restore_range,
+    /* .share_range     = */ ggml_backend_cuda_growable_buffer_share_range,
+    /* .copy_range      = */ ggml_backend_cuda_growable_buffer_copy_range,
 };
 
 static const char * ggml_backend_cuda_growable_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -1235,10 +1592,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_growable_buffer_type_alloc_buffer
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_growable_buffer_interface, ctx, reserved);
 }
 
+static size_t ggml_backend_cuda_growable_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    const size_t gran = ggml_cuda_info().devices[ctx->device].vmm_granularity;
+    return gran ? gran : 128;
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_cuda_growable_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_cuda_growable_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_growable_buffer_type_alloc_buffer,
-    /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_alignment    = */ ggml_backend_cuda_growable_buffer_type_get_alignment,
     /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
     /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
@@ -1310,6 +1673,21 @@ void ggml_backend_cuda_buffer_stats(ggml_backend_buffer_t buffer,
     if (release_ops) { *release_ops = 0; }
 }
 
+void ggml_backend_cuda_buffer_evict_stats(ggml_backend_buffer_t buffer,
+        size_t * host_bytes, size_t * evict_ops, size_t * restore_ops) {
+#if defined(GGML_USE_VMM)
+    if (buffer != nullptr && buffer->iface.free_buffer == ggml_backend_cuda_growable_buffer_free_buffer) {
+        ggml_backend_cuda_growable_buffer_context * ctx = (ggml_backend_cuda_growable_buffer_context *) buffer->context;
+        if (host_bytes)  { *host_bytes  = (size_t) ctx->host_bytes;  }
+        if (evict_ops)   { *evict_ops   = (size_t) ctx->evict_ops;   }
+        if (restore_ops) { *restore_ops = (size_t) ctx->restore_ops; }
+        return;
+    }
+#endif
+    if (host_bytes)  { *host_bytes  = 0; }
+    if (evict_ops)   { *evict_ops   = 0; }
+    if (restore_ops) { *restore_ops = 0; }
+}
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
 // Created once per meta backend instance.  Resources for the selected mode
@@ -5740,6 +6118,17 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_lazy_buffer_type(
     return nullptr;
 }
 
+static size_t ggml_backend_cuda_device_get_lazy_granule(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_VMM)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (ggml_cuda_info().devices[dev_ctx->device].vmm) {
+        return ggml_cuda_info().devices[dev_ctx->device].vmm_granularity;
+    }
+#endif
+    GGML_UNUSED(dev);
+    return 0;
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -5757,6 +6146,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
     /* .get_lazy_buffer_type = */ ggml_backend_cuda_device_get_lazy_buffer_type,
+    /* .get_lazy_granule    = */ ggml_backend_cuda_device_get_lazy_granule,
 };
 
 // backend reg

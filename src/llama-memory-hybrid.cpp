@@ -30,7 +30,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                     bool   kv_lazy) :
+                     bool   kv_lazy,
+                     bool   kv_share) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -51,7 +52,8 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         nullptr,
-        kv_lazy
+        kv_lazy,
+        kv_share  // attention KV page-shares like a plain kv_cache; the recurrent half is restored via the server SSM cache
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -65,7 +67,12 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr,
         kv_lazy
-    )) {}
+    )) {
+    // kv-share on a hybrid shares only the ATTENTION KV prefix (mem_attn, exactly like a plain kv_cache). the
+    // recurrent/SSM half cannot be page-aliased; a borrower's recurrent state is restored server-side from an
+    // --ssm-cache snapshot (see the server borrow hook). with --ssm-cache off, the server disables a hybrid
+    // borrow entirely (full prefill), so attention KV is never reused without its matching recurrent state.
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -170,6 +177,25 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
+}
+
+size_t llama_memory_hybrid::seq_evict(llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes) {
+    // only the attention KV scales with context; the recurrent state is small/fixed and not evicted (base no-op).
+    return mem_attn->seq_evict(seq_id, max_bytes, chunk_bytes);
+}
+
+bool llama_memory_hybrid::seq_restore(llama_seq_id seq_id) {
+    return mem_attn->seq_restore(seq_id);
+}
+
+llama_pos llama_memory_hybrid::seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased) {
+    // share only the ATTENTION KV prefix; the recurrent/SSM state is restored server-side from an --ssm-cache
+    // snapshot. the server gates the hybrid borrow on --ssm-cache and reuses only up to min(attention N, SSM snap).
+    return mem_attn->seq_share_prefix(dst, src, n_tokens, out_aliased);
+}
+
+llama_pos llama_memory_hybrid::seq_share_align() const {
+    return mem_attn->seq_share_align();
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {

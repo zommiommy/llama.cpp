@@ -562,6 +562,7 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool kv_lazy          = false; // reserve KV cache VA and commit VRAM on demand (CUDA VMM growable buffers)
+    bool kv_share         = false; // read-only page sharing of a system-prompt prefix across sequences (--kv-share)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -613,11 +614,14 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    ssm_cache           = false; // --ssm-cache: independent recurrent/SSM-state snapshot cache (cross-slot reuse)
+    int32_t ssm_cache_step      = 256;   // tokens between recurrent-state snapshots (independent of KV checkpoints)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t kv_swap_max_active  = 0;   // >0: cap concurrent generating completions; park excess by priority (KV swap)
     int32_t kv_swap_reserve_mib = 0;   // >0: park slots when free VRAM drops below this many MiB (KV swap watermark)
     int32_t kv_swap_ram_mib     = 0;   // >0: RAM budget (MiB) for parked KV blobs before spilling to disk
     std::string kv_swap_dir;           // directory for disk-spilled parked KV blobs (empty = RAM only)
+    int32_t kv_park_granule_mib = 0;   // KV-swap partial-eviction park granule (MiB); 0 = one VMM page; must be a whole multiple of the page
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -994,6 +998,18 @@ struct common_memory {
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };
+
+// page-granular KV eviction (partial reclaim to host RAM); no-op-returns for non-lazy caches
+size_t common_context_seq_evict  (llama_context * ctx, llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes);
+bool   common_context_seq_restore(llama_context * ctx, llama_seq_id seq_id);
+// read-only page sharing of a system-prompt prefix from src into dst (no copy / no extra VRAM); returns tokens shared
+llama_pos common_context_seq_share_prefix(llama_context * ctx, llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased = nullptr);
+// the alignment quantum for common_context_seq_share_prefix (a shared prefix is a multiple); 0 if unsupported
+llama_pos common_context_seq_share_align(llama_context * ctx);
+// restore ONLY the recurrent/SSM (partial) state into dst_seq from a prior snapshot (see --ssm-cache);
+// does not touch attention KV. returns bytes consumed (0 on failure). data/size come from a prior
+// llama_state_seq_get_data_ext(..., LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) on a sibling sequence.
+size_t common_context_seq_restore_ssm(llama_context * ctx, llama_seq_id dst_seq, const uint8_t * data, size_t size);
 
 //
 // Batch utils

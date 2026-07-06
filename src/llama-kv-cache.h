@@ -113,7 +113,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                         bool   kv_lazy = false);
+                         bool   kv_lazy = false,
+                         bool   kv_share = false);
 
     ~llama_kv_cache() = default;
 
@@ -139,6 +140,14 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+
+    // demand-paged (lazy) KV: evict / restore a sequence's committed pages to / from host RAM (partial reclaim).
+    size_t seq_evict  (llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes) override;
+    bool   seq_restore(llama_seq_id seq_id)                                       override;
+
+    // read-only page sharing of a system-prompt prefix from `src` into `dst` (see llama_memory_i::seq_share_prefix).
+    llama_pos seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased = nullptr) override;
+    llama_pos seq_share_align() const override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
@@ -255,6 +264,16 @@ private:
 
     // reserve KV virtual address space and commit physical VRAM on demand (CUDA VMM growable buffers)
     const bool     kv_lazy   = false;
+
+    // read-only page sharing of a system-prompt prefix across per-stream regions (--kv-share).
+    // requires kv_lazy (VMM growable buffer) + non-unified + flash-attn (non-transposed V).
+    const bool     kv_share = false;
+    // cell-count quantum: per-stream kv_size is padded to a multiple so every stream region begins
+    // on a VMM granule boundary (L=1). 0 = sharing disabled for this cache.
+    uint32_t       kv_share_align_cells = 0;
+    // true when the cache was padded so a shared prefix can be page-aliased (read-only, zero-copy); false =>
+    // copy-only sharing (byte-copy the prefix into the borrower's private pages, no VRAM saving). set in ctor B0.
+    bool           kv_share_can_alias = false;
 
     // required padding
     const uint32_t n_pad = 1;

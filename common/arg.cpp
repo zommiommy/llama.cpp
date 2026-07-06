@@ -1703,6 +1703,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ssm-cache"},
+        {"--no-ssm-cache"},
+        "cache recurrent/SSM state snapshots and reuse them across sequences that share a prefix (independent of "
+        "--kv-share; required for prefix reuse on hybrid/recurrent models). snapshots are taken every "
+        "--ssm-cache-step tokens (default: disabled)",
+        [](common_params & params, bool value) {
+            params.ssm_cache = value;
+        }
+    ).set_env("LLAMA_ARG_SSM_CACHE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
+        {"--ssm-cache-step"}, "N",
+        string_format("tokens between recurrent/SSM-state snapshots for --ssm-cache (default: %d)", params.ssm_cache_step),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ssm-cache-step must be >= 1");
+            }
+            params.ssm_cache_step = value;
+        }
+    ).set_env("LLAMA_ARG_SSM_CACHE_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -1731,6 +1751,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.kv_swap_dir = value; }
     ).set_env("LLAMA_ARG_KV_SWAP_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-park-granule-mib"}, "N",
+        "KV-swap: partial-eviction park granule in MiB; must be a whole multiple of the GPU VMM page (default: 0 = one page). Larger = fewer, bigger transfers",
+        [](common_params & params, int value) { params.kv_park_granule_mib = value; }
+    ).set_env("LLAMA_ARG_KV_PARK_GRANULE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -1747,6 +1772,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_lazy = value;
         }
     ).set_env("LLAMA_ARG_KV_LAZY").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
+    add_opt(common_arg(
+        {"--kv-share"},
+        {"--no-kv-share"},
+        "share a system-prompt prefix's KV pages read-only across sequences that start with the same prompt "
+        "(store it once, not once per sequence) instead of recomputing/duplicating it. requires --kv-lazy on a "
+        "VMM device, flash attention, and a non-unified per-stream cache (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_share = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SHARE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},

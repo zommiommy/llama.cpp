@@ -400,6 +400,8 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool kv_lazy;     // reserve KV cache virtual address space and commit VRAM on demand as sequences grow
                           // (CUDA VMM growable buffers); peak VRAM tracks actual token usage. no effect without VMM.
+        bool kv_share;    // read-only page sharing of a system-prompt prefix across sequences (--kv-share);
+                          // requires kv_lazy + flash attention + a non-unified per-stream cache.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -743,6 +745,34 @@ extern "C" {
               llama_seq_id seq_id,
                  llama_pos p0,
                  llama_pos p1);
+
+    // --- page-granular eviction (partial KV reclaim to host RAM) ---
+    // evict up to max_bytes of seq_id's committed KV to host RAM in chunk_bytes chunks; returns bytes freed.
+    // keeps the sequence intact (unlike seq_rm) so llama_memory_seq_restore brings it back byte-identically.
+    // only demand-paged (--kv-lazy) KV caches implement this; others return 0 / true.
+    LLAMA_API size_t llama_memory_seq_evict(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    size_t max_bytes,
+                    size_t chunk_bytes);
+
+    // restore all pages of seq_id previously evicted by llama_memory_seq_evict; returns false on device OOM.
+    LLAMA_API bool llama_memory_seq_restore(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // read-only page sharing of a system-prompt prefix: alias the leading `n_tokens` of `src`'s KV into `dst`
+    // (no copy, no extra VRAM), marking dst's prefix cells present. returns tokens shared (0 = not shared).
+    // only demand-paged (--kv-share) per-stream KV caches implement this; others return 0.
+    LLAMA_API llama_pos llama_memory_seq_share_prefix(
+            llama_memory_t mem,
+              llama_seq_id dst,
+              llama_seq_id src,
+                 llama_pos n_tokens,
+                 llama_pos * out_aliased);
+
+    // the cell-count quantum a shared prefix snaps to (whole multiple), or 0 if this memory cannot page-share.
+    LLAMA_API llama_pos llama_memory_seq_share_align(llama_memory_t mem);
 
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]

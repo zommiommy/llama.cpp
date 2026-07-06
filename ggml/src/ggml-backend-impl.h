@@ -65,6 +65,21 @@ extern "C" {
         // (optional) release physical pages of any granule wholly contained in [offset, offset+size).
         // arbitrary interior range; partial edge granules shared with neighbors stay resident. NULL means no-op.
         void         (*release_range)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+        // (optional) evict physical pages of granules wholly contained in [offset, offset+size) to host RAM,
+        // preserving contents, in chunks of `chunk_bytes` (rounded up to whole granules), stopping once
+        // `max_bytes` of NEWLY-freed pages is reached (SIZE_MAX = whole range); returns bytes freed.
+        // reclaims VRAM from a paused sequence without discarding its KV. NULL means unsupported (returns 0).
+        size_t       (*evict_range) (ggml_backend_buffer_t buffer, size_t offset, size_t size, size_t chunk_bytes, size_t max_bytes);
+        // (optional) restore previously evicted pages overlapping [offset, offset+size) from host RAM; false on OOM.
+        bool         (*restore_range)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+        // (optional) map the owner's physical pages backing granule-aligned [src_off, +size) into [dst_off, +size)
+        // READ-ONLY within the same buffer (system-prompt prefix reuse); returns bytes shared, commits no new memory.
+        // both offsets and size must be whole-granule aligned; NULL means unsupported (returns 0).
+        size_t       (*share_range) (ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size);
+        // (optional) device-to-device byte copy of [src_off, +size) into [dst_off, +size) within the same buffer.
+        // commits dst pages + ensures src resident, then a synchronous copy; no alignment requirement (unlike share_range).
+        // used to copy a sub-granule KV prefix remainder into a borrower's private pages. NULL means unsupported (returns 0).
+        size_t       (*copy_range)  (ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size);
     };
 
     struct ggml_backend_buffer {
@@ -209,6 +224,10 @@ extern "C" {
         // (optional) buffer type that reserves virtual address space and commits physical memory on demand
         // (returns a growable buffer type). NULL if the device does not support demand paging.
         ggml_backend_buffer_type_t (*get_lazy_buffer_type)(ggml_backend_dev_t dev);
+
+        // (optional) physical allocation granularity in bytes of the demand-paged buffer type above (e.g. CUDA VMM page).
+        // 0 if the device does not support demand paging. used to validate/round KV eviction chunk sizes.
+        size_t (*get_lazy_granule)(ggml_backend_dev_t dev);
     };
 
     struct ggml_backend_device {

@@ -1473,6 +1473,10 @@ static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
     /* .reset           = */ nullptr,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range    = */ NULL,
+    /* .restore_range  = */ NULL,
+    /* .share_range    = */ NULL,
+    /* .copy_range     = */ NULL,
 };
 
 static const char * ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name(ggml_backend_buffer_type_t buft) {

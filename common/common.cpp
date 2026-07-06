@@ -1605,6 +1605,26 @@ static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llam
     }
 }
 
+size_t common_context_seq_evict(llama_context * ctx, llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes) {
+    return llama_memory_seq_evict(llama_get_memory(ctx), seq_id, max_bytes, chunk_bytes);
+}
+
+bool common_context_seq_restore(llama_context * ctx, llama_seq_id seq_id) {
+    return llama_memory_seq_restore(llama_get_memory(ctx), seq_id);
+}
+
+llama_pos common_context_seq_share_prefix(llama_context * ctx, llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased) {
+    return llama_memory_seq_share_prefix(llama_get_memory(ctx), dst, src, n_tokens, out_aliased);
+}
+
+llama_pos common_context_seq_share_align(llama_context * ctx) {
+    return llama_memory_seq_share_align(llama_get_memory(ctx));
+}
+
+size_t common_context_seq_restore_ssm(llama_context * ctx, llama_seq_id dst_seq, const uint8_t * data, size_t size) {
+    return llama_state_seq_set_data_ext(ctx, data, size, dst_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+}
+
 static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
@@ -1724,6 +1744,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.kv_lazy           = params.kv_lazy;
+    cparams.kv_share          = params.kv_share;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

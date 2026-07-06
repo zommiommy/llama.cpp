@@ -217,6 +217,38 @@ void ggml_backend_buffer_release_range(ggml_backend_buffer_t buffer, size_t offs
     }
 }
 
+size_t ggml_backend_buffer_evict_range(ggml_backend_buffer_t buffer, size_t offset, size_t size, size_t chunk_bytes, size_t max_bytes) {
+    GGML_ASSERT(buffer);
+    if (buffer->iface.evict_range) {
+        return buffer->iface.evict_range(buffer, offset, size, chunk_bytes, max_bytes);
+    }
+    return 0;
+}
+
+bool ggml_backend_buffer_restore_range(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    GGML_ASSERT(buffer);
+    if (buffer->iface.restore_range) {
+        return buffer->iface.restore_range(buffer, offset, size);
+    }
+    return true;
+}
+
+size_t ggml_backend_buffer_share_range(ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size) {
+    GGML_ASSERT(buffer);
+    if (buffer->iface.share_range) {
+        return buffer->iface.share_range(buffer, dst_off, src_off, size);
+    }
+    return 0;
+}
+
+size_t ggml_backend_buffer_copy_range(ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size) {
+    GGML_ASSERT(buffer);
+    if (buffer->iface.copy_range) {
+        return buffer->iface.copy_range(buffer, dst_off, src_off, size);
+    }
+    return 0;
+}
+
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (dst_buf->iface.cpy_tensor) {
@@ -629,6 +661,14 @@ ggml_backend_buffer_type_t ggml_backend_dev_buffer_type_lazy(ggml_backend_dev_t 
     return device->iface.get_lazy_buffer_type(device);
 }
 
+size_t ggml_backend_dev_lazy_granule(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+    if (device->iface.get_lazy_granule == NULL) {
+        return 0;
+    }
+    return device->iface.get_lazy_granule(device);
+}
+
 ggml_backend_buffer_type_t ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device) {
     GGML_ASSERT(device);
     if (device->iface.get_host_buffer_type == NULL) {
@@ -727,6 +767,10 @@ static const struct ggml_backend_buffer_i ggml_backend_multi_buffer_i = {
     /* .reset           = */ NULL,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range    = */ NULL,
+    /* .restore_range  = */ NULL,
+    /* .share_range    = */ NULL,
+    /* .copy_range     = */ NULL,
 };
 
 ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers) {
@@ -2363,6 +2407,10 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_i = {
     /* .reset           = */ NULL,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range    = */ NULL,
+    /* .restore_range  = */ NULL,
+    /* .share_range    = */ NULL,
+    /* .copy_range     = */ NULL,
 };
 
 static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
@@ -2379,6 +2427,10 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
     /* .reset           = */ NULL,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range    = */ NULL,
+    /* .restore_range  = */ NULL,
+    /* .share_range    = */ NULL,
+    /* .copy_range     = */ NULL,
 };
 
 // CPU backend buffer type
