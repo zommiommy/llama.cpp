@@ -55,6 +55,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool kv_lazy;
+    bool kv_share = false;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 

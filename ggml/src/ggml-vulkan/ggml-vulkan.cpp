@@ -16293,6 +16293,7 @@ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
     /* .event_free           = */ ggml_backend_vk_device_event_free,
     /* .event_synchronize    = */ ggml_backend_vk_device_event_synchronize,
     /* .get_lazy_buffer_type = */ NULL,
+    /* .get_lazy_granule    = */ NULL,
 };
 
 static const char * ggml_backend_vk_reg_get_name(ggml_backend_reg_t reg) {
