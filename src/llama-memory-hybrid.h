@@ -73,6 +73,8 @@ public:
 
     llama_pos seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased = nullptr) override;
     llama_pos seq_share_align() const override;
+    size_t    kv_size_per_token() const override;
+    size_t    rs_state_size()     const override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
