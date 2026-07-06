@@ -40,7 +40,8 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-                     bool   kv_lazy = false);
+                     bool   kv_lazy = false,
+                     bool   kv_share = false);
 
     ~llama_memory_hybrid() = default;
 
@@ -66,6 +67,12 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+
+    size_t seq_evict  (llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes) override;
+    bool   seq_restore(llama_seq_id seq_id)                                       override;
+
+    llama_pos seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased = nullptr) override;
+    llama_pos seq_share_align() const override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;

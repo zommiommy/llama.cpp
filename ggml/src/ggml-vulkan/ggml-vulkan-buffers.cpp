@@ -1045,6 +1045,10 @@ ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
     /* .cpy_tensor_n    = */ ggml_backend_vk_buffer_cpy_tensor_n,
     /* .ensure_range    = */ NULL,
     /* .release_range   = */ NULL,
+    /* .evict_range     = */ NULL,
+    /* .restore_range   = */ NULL,
+    /* .share_range     = */ NULL,
+    /* .copy_range      = */ NULL,
 };
 
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {

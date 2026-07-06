@@ -111,6 +111,10 @@ const ggml_backend_buffer_i ggml_backend_remoting_buffer_interface = {
     /* .cpy_tensor_n    = */ NULL,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range    = */ NULL,
+    /* .restore_range  = */ NULL,
+    /* .share_range    = */ NULL,
+    /* .copy_range     = */ NULL,
 };
 
 const ggml_backend_buffer_i ggml_backend_remoting_buffer_from_ptr_interface = {
@@ -130,4 +134,8 @@ const ggml_backend_buffer_i ggml_backend_remoting_buffer_from_ptr_interface = {
     /* .cpy_tensor_n    = */ NULL,
     /* .ensure_range   = */ NULL,
     /* .release_range  = */ NULL,
+    /* .evict_range    = */ NULL,
+    /* .restore_range  = */ NULL,
+    /* .share_range    = */ NULL,
+    /* .copy_range     = */ NULL,
 };

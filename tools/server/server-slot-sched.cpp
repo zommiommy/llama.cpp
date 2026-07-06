@@ -288,7 +288,8 @@ void server_prompt_cache::update() {
 static std::vector<const server_slot_info *> get_free_slot_infos(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) {
     std::vector<const server_slot_info *> free_slots;
     for (const auto & slot : slots) {
-        if (!slot.is_processing && slot.id != exclude_id_slot) {
+        // a shared-prefix owner is pinned: reusing it would invalidate its borrowers
+        if (!slot.is_processing && slot.id != exclude_id_slot && !slot.pinned) {
             free_slots.push_back(&slot);
         }
     }
@@ -353,6 +354,11 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             // skip the slot if it is not available
             if (slot.is_processing) {
                 SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing);
+                continue;
+            }
+
+            // a shared-prefix owner is pinned: reusing it would invalidate its borrowers
+            if (slot.pinned) {
                 continue;
             }
 

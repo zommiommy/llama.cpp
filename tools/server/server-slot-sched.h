@@ -105,6 +105,9 @@ struct server_slot_info {
     int64_t t_last_used = -1;
 
     const server_prompt * prompt = nullptr;
+
+    // owns a prefix that other slots borrow (--kv-share): it must not be reused or evicted
+    bool pinned = false;
 };
 
 struct server_slot_plan {
