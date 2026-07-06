@@ -121,6 +121,19 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer = hparams.n_layer_all;
 
+    // logical KV bytes to store one token's cache (K+V across all attention KV layers; row size only, no paging).
+    {
+        const bool is_mla_pt = hparams.is_mla();
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (!hparams.has_kv(il))   { continue; }
+            if (filter && !filter(il)) { continue; }
+            n_bytes_per_token += ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+            if (!is_mla_pt) {
+                n_bytes_per_token += ggml_row_size(type_v, !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max());
+            }
+        }
+    }
+
     // [B0 kv-share] pad the per-stream kv_size so each stream region begins on a VMM granule boundary,
     // enabling read-only cross-stream page sharing of a system-prompt prefix (see seq_share_prefix).
     if (kv_share && !other) {

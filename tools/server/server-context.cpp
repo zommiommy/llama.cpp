@@ -187,6 +187,8 @@ struct server_slot {
 
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
+    size_t  kv_bytes_per_token = 0; // logical KV bytes per token (K+V, all attn layers; no paging), set at load
+    size_t  rs_state_bytes     = 0; // recurrent/SSM state bytes per seq (0 for pure-attention), set at load
     int32_t n_keep      = 0;
     int32_t n_decoded   = 0;
     int32_t n_remaining = -1;
@@ -505,7 +507,10 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
-            SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+            SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d, KV+SSM state = %.1f MiB, total time = %.0f ms\n",
+                    prompt.n_tokens(), truncated,
+                    (prompt.n_tokens() * kv_bytes_per_token + rs_state_bytes) / 1024.0 / 1024.0,
+                    (ggml_time_us() - t_start_process_prompt) / 1e3);
 
             t_last_used        =  ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
@@ -1056,6 +1061,11 @@ private:
             llama_state_seq_get_data_ext(slot.ctx_dft, s.prompt.data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        SLT_INF(slot, "kv-swap: PARKED (priority=%d, %d tokens, frees ~%.1f MiB GPU KV+SSM, blob=%.1f MiB to RAM, %zu suspended)\n",
+                s.priority, slot.prompt.n_tokens(),
+                (slot.prompt.n_tokens() * slot.kv_bytes_per_token + slot.rs_state_bytes) / (1024.0*1024.0),
+                (s.prompt.data.main.size() + s.prompt.data.drft.size()) / (1024.0*1024.0), suspended.size() + 1);
+
         s.task = std::move(slot.task);
         s.smpl = std::move(slot.smpl);
         s.prompt.tokens = slot.prompt.tokens.clone();
@@ -1081,8 +1091,6 @@ private:
         slot.i_batch = -1;
         slot.t_start_generation = 0; slot.t_prompt_processing = 0; slot.t_token_generation = 0;
         slot.t_last_used = ggml_time_us();
-        SLT_INF(slot, "kv-swap: PARKED (priority=%d, blob=%.1f MiB, %zu suspended)\n",
-                s.priority, (s.prompt.data.main.size() + s.prompt.data.drft.size()) / (1024.0*1024.0), suspended.size() + 1);
         s.sz_main = s.prompt.data.main.size();
         s.sz_drft = s.prompt.data.drft.size();
         suspended.push_back(std::move(s));
@@ -1143,7 +1151,9 @@ private:
         slot.kv_park_priority  = slot.task->params.priority;
         slot.kv_park_paused_us = ggml_time_us();
         slot.state = SLOT_STATE_PAUSED_RESIDENT;
-        SLT_INF(slot, "kv-park: PAUSED (priority=%d, ctx=%d tokens)\n", slot.kv_park_priority, slot.prompt.n_tokens());
+        SLT_INF(slot, "kv-park: PAUSED (priority=%d, %d tokens) - reclaimable ~%.1f MiB attention KV (freed lazily; recurrent state stays resident)\n",
+                slot.kv_park_priority, slot.prompt.n_tokens(),
+                (slot.prompt.n_tokens() * slot.kv_bytes_per_token) / 1024.0 / 1024.0);
     }
 
     // evict up to `budget` bytes of a paused slot's KV to host RAM; returns bytes freed. draft KV is evicted only
@@ -1776,6 +1786,15 @@ private:
             ctx_dft.reset();
         }
 
+        // memory footprint (logical, independent of paging): per-token KV and per-seq recurrent/SSM state.
+        const llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        const size_t kv_bpt   = llama_memory_kv_size_per_token(mem_tgt);
+        const size_t rs_bytes = llama_memory_rs_state_size(mem_tgt);
+        SRV_INF("memory footprint: KV cache = %.3f KiB/token (K+V, all attention layers)\n", kv_bpt / 1024.0);
+        if (rs_bytes) {
+            SRV_INF("memory footprint: recurrent/SSM state = %.3f MiB/sequence\n", rs_bytes / 1024.0 / 1024.0);
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1784,6 +1803,8 @@ private:
             slot.ctx_dft = ctx_dft.get();
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+            slot.kv_bytes_per_token = kv_bpt;
+            slot.rs_state_bytes     = rs_bytes;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3916,9 +3937,12 @@ private:
                                             slot.borrowed_from   = owner->id;
                                             slot.borrowed_tokens = aliased;
                                         }
-                                        SLT_INF(slot, "kv-share: reused %d/%d prefix tokens from slot %d (attn aliased=%d copied=%d, ssm@%d, owner refcount=%d)\n",
-                                                (int) n_use, (int) input_tokens.size(), owner->id, (int) aliased,
-                                                (int) (attn_shared - aliased), (int) (has_recur ? n_ssm : 0), owner->share_refcount);
+                                        SLT_INF(slot, "kv-share: reused %d/%d tokens from slot %d (attn aliased=%d [%.2f MiB] + copied=%d [%.2f MiB], ssm@%d [%.2f MiB], owner refcount=%d)\n",
+                                                (int) n_use, (int) input_tokens.size(), owner->id,
+                                                (int) aliased, aliased * slot.kv_bytes_per_token / 1024.0 / 1024.0,
+                                                (int) (attn_shared - aliased), (attn_shared - aliased) * slot.kv_bytes_per_token / 1024.0 / 1024.0,
+                                                (int) (has_recur ? n_ssm : 0), (has_recur && n_ssm > 0 ? slot.rs_state_bytes : 0) / 1024.0 / 1024.0,
+                                                owner->share_refcount);
                                     } else {
                                         // clear any partially-restored recurrent/attention state so the full prefill
                                         // below starts from a clean seq (recurrent memory isn't safely overwritten

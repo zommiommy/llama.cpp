@@ -3888,6 +3888,14 @@ llama_pos llama_memory_seq_share_align(llama_memory_t mem) {
     return mem->seq_share_align();
 }
 
+size_t llama_memory_kv_size_per_token(llama_memory_t mem) {
+    return mem ? mem->kv_size_per_token() : 0;
+}
+
+size_t llama_memory_rs_state_size(llama_memory_t mem) {
+    return mem ? mem->rs_state_size() : 0;
+}
+
 bool llama_memory_seq_restore(
         llama_memory_t mem,
           llama_seq_id seq_id) {
