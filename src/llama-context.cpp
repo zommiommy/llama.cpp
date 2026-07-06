@@ -211,6 +211,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.kv_lazy    = params.kv_lazy;
+    cparams.kv_share   = params.kv_share;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -252,6 +253,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: kv_lazy       = %s\n",   __func__, cparams.kv_lazy ? "true" : "false");
+    LLAMA_LOG_INFO("%s: kv_share      = %s\n",   __func__, cparams.kv_share ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -3486,6 +3488,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.kv_lazy                     =*/ false,
+        /*.kv_share                    =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3849,6 +3852,50 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+size_t llama_memory_seq_evict(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+                size_t max_bytes,
+                size_t chunk_bytes) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->seq_evict(seq_id, max_bytes, chunk_bytes);
+}
+
+llama_pos llama_memory_seq_share_prefix(
+        llama_memory_t mem,
+          llama_seq_id dst,
+          llama_seq_id src,
+             llama_pos n_tokens,
+             llama_pos * out_aliased) {
+    if (!mem) {
+        if (out_aliased) { *out_aliased = 0; }
+        return 0;
+    }
+
+    return mem->seq_share_prefix(dst, src, n_tokens, out_aliased);
+}
+
+llama_pos llama_memory_seq_share_align(llama_memory_t mem) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->seq_share_align();
+}
+
+bool llama_memory_seq_restore(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_restore(seq_id);
 }
 
 void llama_memory_seq_cp(

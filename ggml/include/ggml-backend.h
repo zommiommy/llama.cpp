@@ -72,6 +72,18 @@ extern "C" {
     GGML_API bool                           ggml_backend_buffer_ensure_range  (ggml_backend_buffer_t buffer, size_t offset, size_t size);
     // release physical pages of any granule wholly contained in [offset, offset+size); no-op if unsupported.
     GGML_API void                           ggml_backend_buffer_release_range (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+    // evict physical pages of granules wholly contained in [offset, offset+size) to host RAM, preserving contents,
+    // in chunks of `chunk_bytes`, stopping after `max_bytes` newly-freed; returns bytes freed (0 if unsupported).
+    GGML_API size_t                         ggml_backend_buffer_evict_range   (ggml_backend_buffer_t buffer, size_t offset, size_t size, size_t chunk_bytes, size_t max_bytes);
+    // restore previously evicted pages overlapping [offset, offset+size); false on OOM (true if unsupported).
+    GGML_API bool                           ggml_backend_buffer_restore_range (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+    // map the owner's physical pages of granule-aligned [src_off, +size) into [dst_off, +size) read-only within the
+    // same buffer (system-prompt prefix reuse); returns bytes shared, commits no new memory (0 if unsupported).
+    GGML_API size_t                         ggml_backend_buffer_share_range   (ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size);
+
+    // device-to-device byte copy within the same buffer (system-prompt prefix remainder into a borrower's private
+    // pages); returns bytes copied, 0 if unsupported. no alignment requirement.
+    GGML_API size_t                         ggml_backend_buffer_copy_range    (ggml_backend_buffer_t buffer, size_t dst_off, size_t src_off, size_t size);
 
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
@@ -193,6 +205,8 @@ extern "C" {
     // (optional) buffer type that reserves virtual address space and commits physical memory on demand.
     // returns NULL if the device does not support demand paging (fall back to ggml_backend_dev_buffer_type).
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_buffer_type_lazy(ggml_backend_dev_t device);
+    // physical allocation granularity (bytes) of the demand-paged buffer type; 0 if no demand paging.
+    GGML_API size_t                        ggml_backend_dev_lazy_granule    (ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 

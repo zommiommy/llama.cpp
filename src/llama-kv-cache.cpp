@@ -11,7 +11,11 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <stdexcept>
+
+// max fraction the per-stream KV stride may grow when padding for --kv-share granule alignment (B0).
+static constexpr double KV_SHARE_MAX_PAD_FRAC = 0.125;
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -94,9 +98,10 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-                     bool   kv_lazy) :
+                     bool   kv_lazy,
+                     bool   kv_share) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), kv_lazy(kv_lazy), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), kv_lazy(kv_lazy), kv_share(kv_share), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -115,6 +120,66 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
+
+    // [B0 kv-share] pad the per-stream kv_size so each stream region begins on a VMM granule boundary,
+    // enabling read-only cross-stream page sharing of a system-prompt prefix (see seq_share_prefix).
+    if (kv_share && !other) {
+        if (n_stream == 1) {
+            // unified cache shares a prefix natively (cells stay resident, seq_id added); no padding needed.
+            LLAMA_LOG_INFO("%s: kv-share: unified cache shares prefixes natively; no padding\n", __func__);
+        } else {
+            if (v_trans) {
+                LLAMA_LOG_ERROR("%s: kv-share requires flash attention (non-transposed V); enable -fa\n", __func__);
+                throw std::runtime_error("kv-share requires flash attention");
+            }
+            const bool is_mla_share = hparams.is_mla();
+            size_t   max_gran    = 0;
+            uint32_t align_cells = 1;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (!hparams.has_kv(il))   { continue; }
+                if (filter && !filter(il)) { continue; }
+                size_t gran_l = 0;
+                if (offload && kv_lazy) {
+                    gran_l = ggml_backend_dev_lazy_granule(model.dev_layer(il));
+                }
+                if (gran_l == 0) {
+                    LLAMA_LOG_ERROR("%s: kv-share requires every attention KV layer on a lazy VMM buffer; "
+                            "layer %u is not (need --kv-lazy + GPU offload + VMM)\n", __func__, il);
+                    throw std::runtime_error("kv-share requires --kv-lazy VMM buffers for all KV layers");
+                }
+                max_gran = std::max(max_gran, gran_l);
+                const size_t row_k = ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+                align_cells = std::lcm(align_cells, (uint32_t) (gran_l / std::gcd(row_k, gran_l)));
+                if (!is_mla_share) {
+                    const size_t row_v = ggml_row_size(type_v, hparams.n_embd_v_gqa(il));
+                    align_cells = std::lcm(align_cells, (uint32_t) (gran_l / std::gcd(row_v, gran_l)));
+                }
+            }
+            if (max_gran == 0) { // no filtered-in attention KV layer at all
+                LLAMA_LOG_ERROR("%s: kv-share found no attention KV layers to share\n", __func__);
+                throw std::runtime_error("kv-share: no attention KV layers to share");
+            }
+            const uint32_t pad_to = std::lcm(align_cells, n_pad); // keep the kv_size % n_pad invariant after padding
+            const uint32_t orig   = kv_size;
+            const uint32_t padded = ((kv_size + pad_to - 1) / pad_to) * pad_to;
+            const double   frac   = orig ? double(padded - orig) / double(orig) : 0.0;
+            kv_share_align_cells = align_cells;  // always advertise the alias quantum (used for the alias split)
+            if (frac > KV_SHARE_MAX_PAD_FRAC) {
+                // too costly to pad for aliasing (e.g. large-quantum quant KV + small context): leave the cache
+                // unpadded and fall back to copy-only sharing (device-to-device byte copy of the whole shared
+                // prefix). saves prefill compute, no VRAM saving, no bloat, no crash (see seq_share_prefix).
+                LLAMA_LOG_WARN("%s: kv-share: per-stream KV stride would pad +%.0f%% (align quantum = %u cells) "
+                        "under this KV type/size; using copy-only sharing (no VRAM saving)\n",
+                        __func__, frac * 100.0, align_cells);
+                kv_share_can_alias = false;
+            } else {
+                kv_size = padded;
+                kv_share_can_alias = true;
+                LLAMA_LOG_INFO("%s: kv-share: align_cells=%u, kv_size padded %u -> %u (+%.1f%%); aliasing enabled\n",
+                        __func__, align_cells, orig, padded, frac * 100.0);
+            }
+        }
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -2608,6 +2673,77 @@ static void kv_lazy_release_tail(const ggml_tensor * t, uint32_t stream, uint32_
     ggml_backend_buffer_release_range(t->buffer, tail_off, tail_len);
 }
 
+// evict the [stream*nb2, +len) window of a KV tensor to host RAM in chunk_bytes chunks, stopping after
+// max_bytes newly-freed; returns bytes freed. no-op for null / non-growable buffers (returns 0).
+static size_t kv_lazy_evict_window(const ggml_tensor * t, uint32_t stream, size_t len, size_t chunk_bytes, size_t max_bytes) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return 0;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return 0;
+    }
+    const size_t off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) stream * t->nb[2];
+    return ggml_backend_buffer_evict_range(t->buffer, off, len, chunk_bytes, max_bytes);
+}
+
+// restore the [stream*nb2, +len) window of a KV tensor previously evicted; false on OOM (true if unsupported).
+static bool kv_lazy_restore_window(const ggml_tensor * t, uint32_t stream, size_t len) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return true;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return true;
+    }
+    const size_t off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) stream * t->nb[2];
+    return ggml_backend_buffer_restore_range(t->buffer, off, len);
+}
+
+// share the [s_src*nb2, +len) window of a KV tensor into its [s_dst*nb2, +len) window READ-ONLY (page alias);
+// returns bytes shared (== len on success, 0 if unsupported / not fully shareable). commits no new VRAM.
+static size_t kv_lazy_share_window(const ggml_tensor * t, uint32_t s_dst, uint32_t s_src, size_t len) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return 0;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return 0;
+    }
+    const size_t doff = (size_t) ((const char *) t->data - (const char *) base) + (size_t) s_dst * t->nb[2];
+    const size_t soff = (size_t) ((const char *) t->data - (const char *) base) + (size_t) s_src * t->nb[2];
+    return ggml_backend_buffer_share_range(t->buffer, doff, soff, len);
+}
+
+// copy cells [cell0, cell1) of a KV tensor from stream s_src to s_dst (device-to-device byte copy into the
+// borrower's PRIVATE pages, committing them); returns bytes copied (== len on success, 0 if unsupported / short).
+static size_t kv_lazy_copy_window(const ggml_tensor * t, uint32_t s_dst, uint32_t s_src, uint32_t cell0, uint32_t cell1) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr || cell1 <= cell0) {
+        return 0;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return 0;
+    }
+    const size_t len  = (size_t) (cell1 - cell0) * t->nb[1];
+    const size_t doff = (size_t) ((const char *) t->data - (const char *) base) + (size_t) s_dst * t->nb[2] + (size_t) cell0 * t->nb[1];
+    const size_t soff = (size_t) ((const char *) t->data - (const char *) base) + (size_t) s_src * t->nb[2] + (size_t) cell0 * t->nb[1];
+    return ggml_backend_buffer_copy_range(t->buffer, doff, soff, len);
+}
+
+// release a borrowed [stream*nb2, +len) shared window of a KV tensor (unmaps the read-only alias; no commit change).
+static void kv_lazy_release_window(const ggml_tensor * t, uint32_t stream, size_t len) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return;
+    }
+    void * base = ggml_backend_buffer_get_base(t->buffer);
+    if (base == nullptr) {
+        return;
+    }
+    const size_t off = (size_t) ((const char *) t->data - (const char *) base) + (size_t) stream * t->nb[2];
+    ggml_backend_buffer_release_range(t->buffer, off, len);
+}
+
 bool llama_kv_cache::ensure_kv_window(const slot_info & sinfo) {
     if (!kv_lazy) {
         return true;
@@ -2690,6 +2826,159 @@ void llama_kv_cache::release_all() {
             kv_lazy_release_tail(layer.v, s, 0);
         }
     }
+}
+
+size_t llama_kv_cache::seq_evict(llama_seq_id seq_id, size_t max_bytes, size_t chunk_bytes) {
+    if (!kv_lazy) {
+        return 0;
+    }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    const uint32_t s    = seq_to_stream[seq_id];
+    const uint32_t used = v_cells[s].used_max_p1();
+    if (used == 0) {
+        return 0;
+    }
+    // pass each full per-layer stream region; the buffer scans it, skips already-evicted windows, and stops after
+    // freeing the remaining budget -> repeated calls advance progressively deeper. mirrors ensure_kv_window's len
+    // logic: K and non-transposed V use the used-cell prefix; transposed V evicts its full strided region.
+    size_t freed = 0;
+    for (const auto & layer : layers) {
+        if (freed >= max_bytes) {
+            break;
+        }
+        if (layer.k) {
+            freed += kv_lazy_evict_window(layer.k, s, (size_t) used * layer.k->nb[1], chunk_bytes, max_bytes - freed);
+        }
+        if (freed >= max_bytes) {
+            break;
+        }
+        if (layer.v) {
+            const size_t len = v_trans ? layer.v->nb[2] : (size_t) used * layer.v->nb[1];
+            freed += kv_lazy_evict_window(layer.v, s, len, chunk_bytes, max_bytes - freed);
+        }
+    }
+    return freed;
+}
+
+bool llama_kv_cache::seq_restore(llama_seq_id seq_id) {
+    if (!kv_lazy) {
+        return true;
+    }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    const uint32_t s    = seq_to_stream[seq_id];
+    const uint32_t used = v_cells[s].used_max_p1();
+    bool ok = true;
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            ok = kv_lazy_restore_window(layer.k, s, (size_t) used * layer.k->nb[1]) && ok;
+        }
+        if (layer.v) {
+            const size_t len = v_trans ? layer.v->nb[2] : (size_t) used * layer.v->nb[1];
+            ok = kv_lazy_restore_window(layer.v, s, len) && ok;
+        }
+    }
+    return ok;
+}
+
+llama_pos llama_kv_cache::seq_share_prefix(llama_seq_id dst, llama_seq_id src, llama_pos n_tokens, llama_pos * out_aliased) {
+    if (out_aliased) { *out_aliased = 0; }
+    // only demand-paged, per-stream caches (padded or copy-only) can page-share (see ctor B0 + design).
+    // v_trans is gated out: transposed V has no contiguous prefix, and advancing n_past with only K backed
+    // would read unbacked V. kv_share_align_cells == 0 means sharing is disabled for this cache (e.g. unified).
+    if (!kv_share || kv_share_align_cells == 0 || v_trans || other || n_stream <= 1) {
+        return 0;
+    }
+    if (n_tokens <= 0) {
+        return 0;
+    }
+    GGML_ASSERT(src >= 0 && (size_t) src < seq_to_stream.size());
+    GGML_ASSERT(dst >= 0 && (size_t) dst < seq_to_stream.size());
+    const uint32_t s_src = seq_to_stream[src];
+    const uint32_t s_dst = seq_to_stream[dst];
+    if (s_src == s_dst) {
+        return 0;  // same physical stream: nothing to reuse
+    }
+
+    // reuse the whole matched prefix [0, n); clamp to physical cells.
+    uint32_t n = (uint32_t) n_tokens;
+    if (n > get_size()) {
+        n = get_size();
+    }
+    if (n == 0) {
+        return 0;
+    }
+    // split: page-alias the granule-aligned bulk [0, n_alias) (only when padded for aliasing), then
+    // device-to-device byte-copy the sub-quantum remainder [n_alias, n) into dst's private pages.
+    const uint32_t align = kv_share_align_cells;
+    uint32_t n_alias = 0;
+    if (kv_share_can_alias) {
+        n_alias = (n / align) * align;
+        const uint32_t cap = (get_size() / align) * align;
+        if (n_alias > cap) {
+            n_alias = cap;
+        }
+    }
+
+    auto & src_cells = v_cells[s_src];
+    auto & dst_cells = v_cells[s_dst];
+
+    // owner must hold the whole prefix [0, n) as seq `src`, unshifted; dst prefix must be empty.
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!src_cells.seq_has(i, src) || src_cells.get_shift(i) != 0) {
+            return 0;
+        }
+        if (!dst_cells.is_empty(i)) {
+            return 0;
+        }
+    }
+
+    // (1) page-alias [0, n_alias) read-only; (2) byte-copy [n_alias, n) into dst's private pages.
+    // all-or-nothing: on any failure, release the borrowed alias windows and return 0 (copied private
+    // pages are harmless; the fallback full-prefill overwrites them).
+    std::vector<const ggml_tensor *> borrowed;
+    borrowed.reserve(layers.size() * 2);
+    bool ok = true;
+    for (const auto & layer : layers) {
+        for (const ggml_tensor * t : { layer.k, layer.v }) {
+            if (t == nullptr) { continue; }
+            if (n_alias > 0) {
+                const size_t len = (size_t) n_alias * t->nb[1];
+                if (kv_lazy_share_window(t, s_dst, s_src, len) != len) { ok = false; break; }
+                borrowed.push_back(t);
+            }
+            if (n > n_alias) {
+                const size_t len = (size_t) (n - n_alias) * t->nb[1];
+                if (kv_lazy_copy_window(t, s_dst, s_src, n_alias, n) != len) { ok = false; break; }
+            }
+        }
+        if (!ok) { break; }
+    }
+    if (!ok) {
+        for (const ggml_tensor * t : borrowed) {
+            kv_lazy_release_window(t, s_dst, (size_t) n_alias * t->nb[1]);
+        }
+        return 0;
+    }
+
+    // all reuse succeeded -> mark dst prefix cells [0, n) present (decode-free), mirroring seq_cp's metadata path.
+    for (uint32_t i = 0; i < n; ++i) {
+        dst_cells.pos_set(i, src_cells.pos_get(i));
+        dst_cells.seq_add(i, dst);
+        dst_cells.ext_set(i, src_cells.ext_get(i));
+    }
+    v_heads[s_dst] = std::max<uint32_t>(v_heads[s_dst], n);
+
+    if (out_aliased) { *out_aliased = (llama_pos) n_alias; }
+    LLAMA_LOG_DEBUG("%s: reused %u prefix tokens (aliased %u + copied %u): seq %d <- %d (stream %u <- %u)\n",
+            __func__, n, n_alias, n - n_alias, dst, src, s_dst, s_src);
+    return (llama_pos) n;
+}
+
+llama_pos llama_kv_cache::seq_share_align() const {
+    if (!kv_share || kv_share_align_cells == 0 || v_trans || other || n_stream <= 1) {
+        return 0;
+    }
+    return (llama_pos) kv_share_align_cells;
 }
 
 bool llama_kv_cache_context::apply() {

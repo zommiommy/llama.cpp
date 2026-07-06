@@ -62,6 +62,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_PAUSED_RESIDENT, // paused for partial KV eviction: keeps slot/cells/sampler, excluded from the batch
 };
 
 struct server_slot; // forward declaration
@@ -191,6 +192,20 @@ struct server_slot {
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
     int32_t kv_swap_resume_n_decoded = -1; // n_decoded at last kv-swap resume (-1 = not resumed); enforces min residency before re-park
+    size_t  kv_park_evicted_bytes = 0;  // bytes of this slot's KV currently evicted to host RAM (partial park)
+    int32_t kv_park_priority      = 0;  // task priority captured at pause (resume ordering)
+    int64_t kv_park_paused_us     = 0;  // pause timestamp (resume oldest-first among equal priority)
+
+    // --- read-only KV prefix sharing (--kv-share) ---
+    int32_t      share_refcount  = 0;   // OWNER: borrowers aliasing this slot's prefix (pins it: no evict/park/reuse)
+    llama_seq_id borrowed_from   = -1;  // BORROWER: owner slot id we borrowed a prefix from (-1 = not borrowing)
+    llama_pos    borrowed_tokens = 0;   // BORROWER: number of prefix tokens borrowed
+
+    // --- independent recurrent/SSM-state snapshots (--ssm-cache) ---
+    // slot-local (NOT part of server_prompt, so never cloned into the prompt cache or parked state);
+    // OWNER stores recurrent state at prefix positions for resident-sibling reuse. cleared on reset().
+    struct ssm_snapshot { llama_pos pos = 0; std::vector<uint8_t> data; };
+    std::vector<ssm_snapshot> ssm_snaps;
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
@@ -266,6 +281,7 @@ struct server_slot {
         }
 
         prompt.tokens.clear();
+        ssm_snaps.clear();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -303,6 +319,9 @@ struct server_slot {
 
         n_prompt_tokens_cache = 0;
         kv_swap_resume_n_decoded = -1;
+        kv_park_evicted_bytes = 0;
+        kv_park_priority      = 0;
+        kv_park_paused_us     = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -946,6 +965,8 @@ private:
     std::string kv_swap_dir;                  // dir for disk-spilled blobs (LLAMA_KV_SWAP_DIR); empty = RAM only
     int32_t kv_swap_ram_mib     = 0;          // RAM budget (MiB) for resident blobs before spilling to disk
     int32_t kv_swap_max_active  = 0;          // >0 = cap concurrent generating completions (park excess by priority)
+    size_t kv_park_chunk_bytes = 0;   // resolved partial-eviction chunk size (bytes); 0 = partial eviction unavailable (no VMM)
+    static constexpr int32_t KV_PARK_MIN_RESIDENCY_TOKENS = 16; // resumed slot generates >= this many tokens before re-park (anti-thrash)
 
     size_t kv_swap_free_vram() const {
         size_t total_free = 0;
@@ -965,7 +986,8 @@ private:
             && slot.spec_draft.empty() && slot.spec_i_batch.empty()
             && slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION
             && slot.task->params.stream
-            && !slot.task->is_parent() && !slot.task->is_child();
+            && !slot.task->is_parent() && !slot.task->is_child()
+            && slot.share_refcount == 0; // pinned as a shared-prefix owner: keep it resident for its borrowers
     }
 
     size_t kv_swap_ram_used() const {
@@ -1053,6 +1075,7 @@ private:
         // (task/smpl/gen-state were moved into `s`; reset() clears the reusable slot fields + unbinds sampler)
         slot.reset();
         slot.prompt.tokens.clear();
+        slot.ssm_snaps.clear();
         // counters reset() does not clear, else the next task assigned here inherits stale values
         slot.n_decoded = 0; slot.n_decoded_last = 0; slot.n_prompt_tokens_processed = 0;
         slot.i_batch = -1;
@@ -1113,6 +1136,121 @@ private:
         SLT_INF(slot, "kv-swap: UNPARKED (priority=%d, %zu still suspended)\n", slot.task->params.priority, suspended.size());
     }
 
+    // --- page-granular partial eviction: keep the slot, evict only enough KV pages to relieve VRAM pressure ---
+
+    // deschedule a running slot without freeing it (excluded from batch build); its KV stays resident until evicted.
+    void kv_park_pause(server_slot & slot) {
+        slot.kv_park_priority  = slot.task->params.priority;
+        slot.kv_park_paused_us = ggml_time_us();
+        slot.state = SLOT_STATE_PAUSED_RESIDENT;
+        SLT_INF(slot, "kv-park: PAUSED (priority=%d, ctx=%d tokens)\n", slot.kv_park_priority, slot.prompt.n_tokens());
+    }
+
+    // evict up to `budget` bytes of a paused slot's KV to host RAM; returns bytes freed. draft KV is evicted only
+    // when no draft is in flight (restore is a no-op when nothing was evicted, so resume can always restore both).
+    size_t kv_park_evict_slot(server_slot & slot, size_t budget) {
+        size_t got = common_context_seq_evict(slot.ctx_tgt, slot.id, budget, kv_park_chunk_bytes);
+        if (slot.ctx_dft && slot.spec_draft.empty() && got < budget) {
+            got += common_context_seq_evict(slot.ctx_dft, slot.id, budget - got, kv_park_chunk_bytes);
+        }
+        slot.kv_park_evicted_bytes += got;
+        return got;
+    }
+
+    // free ~need_bytes of VRAM by evicting KV pages from paused-resident slots, pausing the worst eligible active
+    // run if needed (never the last active). returns bytes freed.
+    size_t kv_park_reclaim(size_t need_bytes) {
+        size_t freed = 0;
+        // (a) evict more from slots already paused-resident
+        for (auto & s : slots) {
+            if (freed >= need_bytes) break;
+            if (s.state == SLOT_STATE_PAUSED_RESIDENT) {
+                freed += kv_park_evict_slot(s, need_bytes - freed);
+            }
+        }
+        // (b) still short -> pause the worst eligible active run and evict it; always keep >= 1 running
+        while (freed < need_bytes) {
+            server_slot * victim = nullptr; int n_active = 0;
+            for (auto & s : slots) {
+                if (!kv_swap_park_eligible(s)) continue;
+                n_active++;
+                if (s.kv_swap_resume_n_decoded >= 0 && (s.n_decoded - s.kv_swap_resume_n_decoded) < KV_PARK_MIN_RESIDENCY_TOKENS) continue;
+                if (!victim) { victim = &s; continue; }
+                const int pv = victim->task->params.priority, ps = s.task->params.priority;
+                if (ps < pv || (ps == pv && s.prompt.n_tokens() > victim->prompt.n_tokens())) victim = &s;
+            }
+            if (!victim || n_active < 2) break;
+            kv_park_pause(*victim);
+            const size_t got = kv_park_evict_slot(*victim, need_bytes - freed);
+            freed += got;
+            if (got == 0) break; // no progress -> stop (avoid spinning)
+        }
+        return freed;
+    }
+
+    // restore a paused-resident slot's evicted KV and resume generation; false (stays paused) on VRAM OOM.
+    bool kv_park_resume(server_slot & slot) {
+        bool ok = common_context_seq_restore(slot.ctx_tgt, slot.id);
+        if (slot.ctx_dft) {
+            ok = common_context_seq_restore(slot.ctx_dft, slot.id) && ok;
+        }
+        if (!ok) {
+            SLT_ERR(slot, "%s", "kv-park: restore failed (VRAM OOM); staying paused, will retry next boundary\n");
+            return false;
+        }
+        slot.state = SLOT_STATE_GENERATING;
+        slot.kv_park_evicted_bytes = 0;
+        slot.kv_swap_resume_n_decoded = slot.n_decoded; // start the post-resume min-residency window
+        SLT_INF(slot, "kv-park: RESUMED (priority=%d)\n", slot.kv_park_priority);
+        return true;
+    }
+
+    // release a borrower slot's read-only prefix alias and unpin its owner. seq_rm(0,-1) empties the borrower's
+    // stream so release_unused_tail unmaps the borrowed head granules (Phase A skips committed-- for borrowed);
+    // then decrement the owner's pin so it can be evicted/reused once no borrowers remain.
+    void kv_share_release(int id_slot) {
+        server_slot * b = get_slot_by_id(id_slot);
+        if (!b || b->borrowed_from < 0) {
+            return;
+        }
+        common_context_seq_rm(b->ctx_tgt, b->id, 0, -1);
+        if (b->ctx_dft) {
+            common_context_seq_rm(b->ctx_dft, b->id, 0, -1);
+        }
+        b->prompt.tokens.keep_first(0);
+        for (auto & s : slots) {
+            if (s.id == b->borrowed_from) {
+                if (s.share_refcount > 0) {
+                    s.share_refcount--;
+                }
+                break;
+            }
+        }
+        SLT_INF(*b, "kv-share: released borrow from slot %d\n", b->borrowed_from);
+        b->borrowed_from   = -1;
+        b->borrowed_tokens = 0;
+    }
+
+    // resolve the partial-eviction park granule from the GPU VMM page (0 => one page). a configured value must be
+    // a whole multiple of every device's page. returns false + err on invalid config (validated at startup).
+    bool kv_park_resolve_chunk_bytes(int32_t granule_mib, std::string & err) {
+        size_t page = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            const size_t g = ggml_backend_dev_lazy_granule(ggml_backend_dev_get(i));
+            if (g == 0) continue;
+            page = std::max(page, g);
+            if (granule_mib > 0 && ((size_t) granule_mib * 1024ull * 1024ull) % g != 0) {
+                err = "--kv-park-granule-mib=" + std::to_string(granule_mib) +
+                      " MiB is not a whole multiple of the GPU VMM page (" + std::to_string(g / (1024 * 1024)) +
+                      " MiB); use a whole multiple";
+                return false;
+            }
+        }
+        kv_park_chunk_bytes = (page == 0) ? 0
+            : (granule_mib > 0 ? (size_t) granule_mib * 1024ull * 1024ull : page);
+        return true;
+    }
+
     // proactive preempt/resume by VRAM watermark; runs at the START of update_slots (safe post-decode boundary)
     void schedule_kv_swap() {
         if (kv_swap_reserve_mib < 0) { // one-time init from CLI/env params
@@ -1121,8 +1259,8 @@ private:
             kv_swap_ram_mib     = params_base.kv_swap_ram_mib;
             kv_swap_dir         = params_base.kv_swap_dir;
             if (kv_swap_reserve_mib > 0 || kv_swap_max_active > 0)
-                SRV_INF("kv-swap scheduler enabled: reserve=%d MiB, max_active=%d, ram=%d MiB, dir='%s'\n",
-                        kv_swap_reserve_mib, kv_swap_max_active, kv_swap_ram_mib, kv_swap_dir.c_str());
+                SRV_INF("kv-swap scheduler enabled: reserve=%d MiB, max_active=%d, ram=%d MiB, dir='%s', park_granule=%zu KiB\n",
+                        kv_swap_reserve_mib, kv_swap_max_active, kv_swap_ram_mib, kv_swap_dir.c_str(), kv_park_chunk_bytes / 1024);
         }
         if (kv_swap_reserve_mib <= 0 && kv_swap_max_active <= 0) return;
         const size_t  reserve = (size_t) (kv_swap_reserve_mib > 0 ? kv_swap_reserve_mib : 0) * 1024ull * 1024ull;
@@ -1142,15 +1280,42 @@ private:
         }
 
         const bool over_count = kv_swap_max_active  > 0 && n_active > kv_swap_max_active;
-        const bool over_vram  = kv_swap_reserve_mib > 0 && kv_swap_free_vram() < reserve;
-        // park the worst victim (one per boundary), but always keep >= 1 slot running
-        if ((over_count || over_vram) && victim && n_active >= 2) {
+        const size_t free_vram = kv_swap_free_vram();
+        const bool over_vram  = kv_swap_reserve_mib > 0 && free_vram < reserve;
+
+        // slot-count pressure: whole-seq park frees a slot (partial eviction cannot). keep >= 1 slot running.
+        if (over_count && victim && n_active >= 2) {
             kv_swap_park(*victim);
             return;
         }
+        // VRAM pressure: prefer page-granular partial eviction (keeps the slot); fall back to whole-seq park only
+        // when VMM demand paging is unavailable (kv_park_chunk_bytes == 0).
+        if (over_vram) {
+            if (kv_park_chunk_bytes > 0) {
+                kv_park_reclaim(reserve - free_vram);
+            } else if (victim && n_active >= 2) {
+                kv_swap_park(*victim);
+            }
+            return;
+        }
 
-        // resume when under the count cap and a slot is free; highest priority, tie-break OLDEST-parked
-        // (FCFS) so a repeatedly-preempted request eventually resumes (anti-starvation)
+        // no pressure -> resume. (a) partial-evicted slots first (cheap: fault pages back in) when VRAM has slack.
+        if (kv_park_chunk_bytes > 0) {
+            server_slot * resume_slot = nullptr;
+            for (auto & s : slots) {
+                if (s.state != SLOT_STATE_PAUSED_RESIDENT) continue;
+                if (!resume_slot
+                    || s.kv_park_priority > resume_slot->kv_park_priority
+                    || (s.kv_park_priority == resume_slot->kv_park_priority && s.kv_park_paused_us < resume_slot->kv_park_paused_us)) {
+                    resume_slot = &s;
+                }
+            }
+            if (resume_slot && (kv_swap_reserve_mib <= 0 || free_vram >= reserve + resume_slot->kv_park_evicted_bytes)) {
+                if (kv_park_resume(*resume_slot)) return;
+            }
+        }
+
+        // (b) resume whole-seq suspended: under the count cap and a slot is free; highest priority, oldest first.
         if (kv_swap_max_active > 0 && n_active >= kv_swap_max_active) return;
         while (!suspended.empty()) {
             server_slot * free_slot = nullptr;
@@ -1423,6 +1588,11 @@ private:
             return false;
         }
 
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("failed to create context for model, '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -1621,6 +1791,7 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                kv_share_release(id_slot);
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1690,6 +1861,16 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        // validate the partial-eviction park granule before serving (both normal + resume paths), so a bad
+        // --kv-park-granule-mib fails at startup with a clear message instead of aborting on the first request.
+        {
+            std::string kv_park_err;
+            if (!kv_park_resolve_chunk_bytes(params_base.kv_park_granule_mib, kv_park_err)) {
+                SRV_ERR("%s\n", kv_park_err.c_str());
+                return false;
+            }
+        }
+
         if (!is_resume) {
             return init();
         }
@@ -1697,6 +1878,7 @@ private:
         if (callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
+
 
         return true;
     }
@@ -1864,6 +2046,11 @@ private:
                     continue;
                 }
 
+                // a shared-prefix owner is pinned: reusing it would invalidate its borrowers
+                if (slot.share_refcount > 0) {
+                    continue;
+                }
+
                 const auto & tokens = slot.prompt.tokens;
 
                 // skip the slot if it does not contains cached tokens
@@ -1904,6 +2091,11 @@ private:
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // a shared-prefix owner is pinned: reusing it would invalidate its borrowers
+                if (slot.share_refcount > 0) {
                     continue;
                 }
 
@@ -2001,6 +2193,7 @@ private:
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.tokens.clear();
+                    slot.ssm_snaps.clear();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -2627,6 +2820,30 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // [ssm-cache] snapshot the recurrent/SSM (partial) state at position `pos` (= tokens processed so far) for
+    // resident-sibling reuse (see --ssm-cache). captured pre-decode like create_checkpoint, but spaced by
+    // ssm_cache_step and stored slot-local (independent of the KV checkpoints).
+    void create_ssm_snapshot(server_slot & slot, llama_pos pos) {
+        // bound the count to ~one per ssm_cache_step over the slot context; drop the oldest when full.
+        const size_t cap = params_base.ssm_cache_step > 0
+            ? (size_t) (slot.n_ctx / params_base.ssm_cache_step) + 2 : 2;
+        while (slot.ssm_snaps.size() >= cap && !slot.ssm_snaps.empty()) {
+            slot.ssm_snaps.erase(slot.ssm_snaps.begin());
+        }
+        const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        server_slot::ssm_snapshot snap;
+        snap.pos = pos;
+        snap.data.resize(sz);
+        const size_t got = llama_state_seq_get_data_ext(ctx_tgt, snap.data.data(), sz, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (got == 0) {
+            return;  // no partial (recurrent) state serialized -> nothing to reuse
+        }
+        snap.data.resize(got);
+        slot.ssm_snaps.push_back(std::move(snap));
+        SLT_DBG(slot, "ssm-cache: snapshot at pos=%d size=%.3f MiB (count=%zu)\n",
+                pos, (float) got / 1024 / 1024, slot.ssm_snaps.size());
+    }
+
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
@@ -2863,11 +3080,13 @@ private:
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
                         slot->prompt.tokens.clear(); // KV may already been invalidated?
+                        slot->ssm_snaps.clear();
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
+                    slot->ssm_snaps.clear();
                     slot->prompt.tokens.insert(tokens);
 
                     const int64_t t_end = ggml_time_us();
@@ -3173,6 +3392,7 @@ private:
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
                     slot.prompt.tokens.clear();
+                    slot.ssm_snaps.clear();
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
@@ -3617,6 +3837,99 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // [B3 kv-share] with no useful own-cache reuse, try to borrow a system-prompt prefix from a
+                        // resident sibling (read-only page alias: no copy, no extra VRAM). gated to configs where the
+                        // shared prefix can never be written (no ctx-shift / chunk-reuse rope rewrites, no speculative
+                        // draft, no mtmd), so the read-only mapping never faults.
+                        if ((params_base.kv_share || params_base.ssm_cache)
+                                && !params_base.ctx_shift
+                                && !slot.ctx_dft
+                                && slot.task->params.n_cache_reuse == 0
+                                && !input_tokens.has_mtmd
+                                && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                            server_slot * owner = nullptr;
+                            llama_pos     best  = 0;
+                            for (auto & s : slots) {
+                                if (&s == &slot)                    { continue; }
+                                if (s.borrowed_from >= 0)           { continue; } // don't chain borrow-of-borrow
+                                if (s.state == SLOT_STATE_PAUSED_RESIDENT) { continue; } // KV may be partially evicted
+                                if (s.prompt.tokens.empty() || s.prompt.tokens.has_mtmd) { continue; }
+                                const llama_pos m = s.prompt.tokens.get_common_prefix(input_tokens);
+                                if (m > best) { best = m; owner = &s; }
+                            }
+                            // always leave >= 1 token for the batch to evaluate (mirrors the [TAG_PROMPT_LOGITS] guard).
+                            best = std::min<llama_pos>(best, (llama_pos) slot.task->n_tokens() - 1);
+                            if (owner && best > 0) {
+                                // model shape decides which halves can be reused:
+                                //  - pure-attention: attention KV prefix          (needs --kv-share)
+                                //  - pure-recurrent: SSM-state snapshot            (needs --ssm-cache; no attention KV)
+                                //  - hybrid:         BOTH, aligned at the snapshot (needs both flags)
+                                const bool is_recurrent = llama_model_is_recurrent(model_tgt);
+                                const bool is_hybrid    = llama_model_is_hybrid(model_tgt);
+                                const bool has_recur    = is_recurrent || is_hybrid;
+                                const bool has_attn     = !is_recurrent;
+
+                                // largest SSM snapshot pos <= best (also bounds the hybrid attention reuse, since
+                                // both halves must be valid at the same position).
+                                llama_pos n_ssm = 0;
+                                const std::vector<uint8_t> * ssm_data = nullptr;
+                                if (params_base.ssm_cache && has_recur) {
+                                    for (const auto & snap : owner->ssm_snaps) {
+                                        if (snap.pos <= best && snap.pos > n_ssm) { n_ssm = snap.pos; ssm_data = &snap.data; }
+                                    }
+                                }
+
+                                llama_pos n_use = 0;
+                                if      (is_hybrid)    { n_use = (params_base.kv_share && n_ssm > 0) ? n_ssm : 0; }
+                                else if (is_recurrent) { n_use = n_ssm; }
+                                else                   { n_use = params_base.kv_share ? best : 0; }
+
+                                if (n_use > n_past) {
+                                    // drop stale KV so the borrow sees empty cells; reset n_past to 0 so any
+                                    // partial-reuse failure falls back to a clean full prefill.
+                                    common_context_seq_rm(slot.ctx_tgt, slot.id, 0, -1);
+                                    slot.prompt.tokens.keep_first(0);
+                                    n_past = 0;
+
+                                    bool ok = true;
+                                    // (1) recurrent/SSM restore first (byte copy, no aliasing) so a later attention
+                                    //     share failure can fall back to full prefill without leaving read-only pages.
+                                    if (has_recur) {
+                                        ok = ssm_data && common_context_seq_restore_ssm(slot.ctx_tgt, slot.id, ssm_data->data(), ssm_data->size()) > 0;
+                                    }
+                                    // (2) attention KV alias+copy (pure-attention / hybrid); recurrent-only caches skip.
+                                    llama_pos aliased = 0, attn_shared = 0;
+                                    if (ok && has_attn && params_base.kv_share) {
+                                        attn_shared = common_context_seq_share_prefix(slot.ctx_tgt, slot.id, owner->id, n_use, &aliased);
+                                        ok = attn_shared > 0;
+                                    }
+
+                                    if (ok) {
+                                        for (llama_pos i = 0; i < n_use; ++i) {
+                                            slot.prompt.tokens.push_back(input_tokens[i]);
+                                        }
+                                        n_past = n_use;
+                                        if (aliased > 0) {
+                                            // only aliased (read-only) attention pages pin the owner; copied cells
+                                            // and the restored SSM state are private and need no pin.
+                                            owner->share_refcount++;
+                                            slot.borrowed_from   = owner->id;
+                                            slot.borrowed_tokens = aliased;
+                                        }
+                                        SLT_INF(slot, "kv-share: reused %d/%d prefix tokens from slot %d (attn aliased=%d copied=%d, ssm@%d, owner refcount=%d)\n",
+                                                (int) n_use, (int) input_tokens.size(), owner->id, (int) aliased,
+                                                (int) (attn_shared - aliased), (int) (has_recur ? n_ssm : 0), owner->share_refcount);
+                                    } else {
+                                        // clear any partially-restored recurrent/attention state so the full prefill
+                                        // below starts from a clean seq (recurrent memory isn't safely overwritten
+                                        // from pos 0 while holding a restored state).
+                                        common_context_seq_rm(slot.ctx_tgt, slot.id, 0, -1);
+                                        n_past = 0;
+                                    }
+                                }
+                            }
+                        }
+
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
@@ -3825,6 +4138,16 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // [ssm-cache] independent recurrent-state snapshot: captured pre-decode (same point as the
+                    // checkpoint above) and labeled with the pre-batch position n_tokens_start, so it reflects
+                    // exactly [0, n_tokens_start) processed tokens. spacing = ssm_cache_step. only for
+                    // recurrent/hybrid models (per the model predicate); inert (no-op) for pure-attention.
+                    if (params_base.ssm_cache && !has_mtmd && pos_min >= 0 && n_tokens_start > 0 &&
+                            (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) &&
+                            (slot.ssm_snaps.empty() || n_tokens_start >= slot.ssm_snaps.back().pos + params_base.ssm_cache_step)) {
+                        create_ssm_snapshot(slot, n_tokens_start);
                     }
                 }
 
