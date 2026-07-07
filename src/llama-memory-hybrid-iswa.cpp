@@ -210,6 +210,12 @@ llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {
     return mem_recr.get();
 }
 
+size_t llama_memory_hybrid_iswa::kv_size_per_token() const {
+    // hybrid-iSWA: delegate to the iSWA attention cache (which sums its base + SWA sub-caches), mirroring
+    // llama_memory_hybrid. Without this, hybrid-SWA models (e.g. lfm2) log 0 KiB/token at load.
+    return mem_attn->kv_size_per_token();
+}
+
 //
 // llama_memory_hybrid_iswa_context
 //
