@@ -1195,6 +1195,10 @@ static void ggml_backend_cuda_growable_buffer_release_range(ggml_backend_buffer_
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    // B1: the backend compute stream is non-blocking and decode() returns without synchronizing, so an
+    // in-flight graph may still be reading/writing these pages. Wait for all device work before cuMemUnmap
+    // tears them out. Off the token hot path (seq lifecycle / tail-window release only).
+    CUDA_CHECK(cudaDeviceSynchronize());
     for (size_t g = g0; g < g1; ++g) {
         if (ctx->borrowed[g]) {
             // drop a read-only shared alias; the owner's mapping keeps the physical page alive (no committed change)
@@ -1235,6 +1239,10 @@ static size_t ggml_backend_cuda_growable_evict(ggml_backend_cuda_growable_buffer
         return 0;
     }
     ggml_cuda_set_device(ctx->device);
+    // B1: sync before the D2H copy below reads live pages -- in-flight non-blocking compute may still be
+    // writing them (decode() returns without syncing). The post-copy per-thread sync only orders copy->unmap.
+    // Off the token hot path (memory-pressure reclaim only).
+    CUDA_CHECK(cudaDeviceSynchronize());
     size_t bytes_freed = 0;
     // walk chunk_gran windows anchored at g0 so repeated evicts of the same region revisit identical windows
     for (size_t cg0 = g0; cg0 < g1; cg0 += chunk_gran) {
@@ -1401,6 +1409,9 @@ static size_t ggml_backend_cuda_growable_copy(ggml_backend_cuda_growable_buffer_
         return 0;
     }
     ggml_cuda_set_device(ctx->device);
+    // B1: the owner slot may be mid-decode writing these src pages on the non-blocking compute stream;
+    // wait for all device work before the D2D read. Off the token hot path (borrow setup only).
+    CUDA_CHECK(cudaDeviceSynchronize());
     // driver-API D2D: the growable buffer is VMM memory (cuMemMap); cuMemcpyDtoDAsync operates on the reserved
     // VA range directly (transparent across physical granules) and matches the driver-side allocation.
     CU_CHECK(cuMemcpyDtoDAsync(ctx->base + (CUdeviceptr) dst_off,
