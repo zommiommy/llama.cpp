@@ -156,6 +156,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+size_t llama_kv_cache_iswa::kv_size_per_token() const {
+    // sum both sub-caches (non-SWA base + SWA layers); without this the iSWA cache falls through to the
+    // llama_memory_i default (0) and the load-time "KV cache = ... KiB/token" footprint log under-reports.
+    return kv_base->kv_size_per_token() + kv_swa->kv_size_per_token();
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
 
