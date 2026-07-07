@@ -110,6 +110,48 @@ build/bin/llama-server \
 
 (`--tensor-split` is the starting point; pin the tuned value after V4/V5.)
 
+## Cross-slot prefix reuse (`--kv-share`, `--ssm-cache`)
+
+When many sequences share a long system prompt, a new request can reuse a resident
+sibling slot's already-computed prefix instead of reprocessing it. Two independent,
+composable mechanisms — both **CUDA-only** and both requiring `--kv-lazy`:
+
+- **`--kv-share`** — attention-KV prefix reuse. The borrower aliases the owner's
+  page-aligned prefix bulk **read-only** (zero extra VRAM) and byte-copies the
+  sub-page remainder into private pages. Requires a config where the shared prefix can
+  never be rewritten: `--no-context-shift`, no `--cache-reuse`, no speculative draft, no
+  multimodal. Enforced at load (errors if any attention KV layer is not on a lazy VMM buffer).
+- **`--ssm-cache`** — recurrent/SSM-state snapshot reuse for hybrid/recurrent models.
+  The owner snapshots its recurrent state every `--ssm-cache-step` tokens (default 256);
+  a borrower restores the largest snapshot ≤ the shared boundary. `--ssm-cache-max-mib`
+  (default 1024, **per slot**; 0 = count-bound only) caps host RAM: oldest snapshots are
+  evicted first, and a single snapshot larger than the budget is skipped. Worst-case host
+  RAM ≈ `--ssm-cache-max-mib × --parallel`.
+- A **hybrid** model needs BOTH flags (attention KV + recurrent state must align at the
+  same boundary); a **pure-recurrent** model needs only `--ssm-cache`; a **pure-attention**
+  model needs only `--kv-share`.
+
+### Quantized-KV tradeoff (alias vs copy)
+
+Page-aliasing needs the shared prefix to end on a 2 MiB page boundary that is ALSO a
+token-row boundary, so the alias quantum is `lcm(row_size, 2 MiB)/row_size` cells:
+
+- **f16** (row divides the granule) → ~1024-cell quantum → prefixes ≳ 1024 tokens
+  **alias** (real VRAM saving) + a small copied tail.
+- **q8_0** (row 1088 B = 2⁶·17) → 32768-cell quantum → for typical (< 32768-token) prompts
+  the whole shared prefix is **byte-copied** into private pages: saves the *prefill compute*
+  but **not VRAM**. Aliasing only engages for prompts ≥ 32768 tokens. f16 and small-quantum
+  types save both compute and VRAM.
+
+### SWA / sliding-window models
+
+`--ssm-cache` is **automatically disabled** on a sliding-window-attention model (effective
+`n_swa > 0`): restoring a mid-context recurrent state against an attention window whose older
+keys have slid out is a silent correctness hazard. The server logs
+`SSM cache disabled: SWA model (n_swa=…)` once at load and falls back to full prefill.
+`--swa-full` makes attention dense (effective `n_swa = 0`), which re-enables the cache.
+(`--kv-lazy` itself already keeps SWA/iSWA attention caches eager — see Scope below.)
+
 ## Scope and limitations (v1)
 
 - **Applies to** standard attention (`llama_kv_cache`), hybrid
