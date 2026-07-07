@@ -616,6 +616,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     bool    ssm_cache           = false; // --ssm-cache: independent recurrent/SSM-state snapshot cache (cross-slot reuse)
     int32_t ssm_cache_step      = 256;   // tokens between recurrent-state snapshots (independent of KV checkpoints)
+    int32_t ssm_cache_max_mib  = 1024;  // --ssm-cache-max-mib: per-slot host-RAM budget for SSM snapshots (0 = count-bound only)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t kv_swap_max_active  = 0;   // >0: cap concurrent generating completions; park excess by priority (KV swap)
     int32_t kv_swap_reserve_mib = 0;   // >0: park slots when free VRAM drops below this many MiB (KV swap watermark)
