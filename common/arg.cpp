@@ -1484,6 +1484,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SSM_CACHE_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ssm-cache-max-mib"}, "N",
+        string_format("per-slot host-RAM budget (MiB) for --ssm-cache snapshots; oldest evicted first when "
+                      "exceeded, oversize snapshots skipped; 0 = count-bound only (default: %d)", params.ssm_cache_max_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ssm-cache-max-mib must be >= 0 (0 = count-bound only)");
+            }
+            params.ssm_cache_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_SSM_CACHE_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

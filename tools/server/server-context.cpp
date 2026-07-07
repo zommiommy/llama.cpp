@@ -1735,6 +1735,9 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+        if (params_base.ssm_cache && n_swa > 0) {
+            SRV_WRN("SSM cache disabled: SWA model (n_swa=%d) -- recurrent state reuse is unsafe with a sliding attention window\n", n_swa);
+        }
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -2841,6 +2844,14 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // [ssm-cache] SSM snapshot capture/restore is safe only on a dense (non-SWA) recurrent/hybrid model:
+    // on an SWA/iSWA model a mid-context recurrent restore can pair with an attention window whose older
+    // keys were slid out (silent correctness hazard). n_swa is the *effective* window (0 under --swa-full).
+    bool ssm_cache_active() const {
+        return params_base.ssm_cache && n_swa == 0 &&
+               (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt));
+    }
+
     // [ssm-cache] snapshot the recurrent/SSM (partial) state at position `pos` (= tokens processed so far) for
     // resident-sibling reuse (see --ssm-cache). captured pre-decode like create_checkpoint, but spaced by
     // ssm_cache_step and stored slot-local (independent of the KV checkpoints).
@@ -2852,6 +2863,26 @@ private:
             slot.ssm_snaps.erase(slot.ssm_snaps.begin());
         }
         const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // B2: bound per-slot host-RAM by byte budget (independent of the count cap above). Enforce on the
+        // upper-bound `sz` BEFORE allocating, so resident RAM never transiently spikes past budget.
+        const size_t ssm_budget = params_base.ssm_cache_max_mib > 0
+            ? (size_t) params_base.ssm_cache_max_mib * 1024 * 1024 : 0;
+        if (ssm_budget > 0) {
+            if (sz > ssm_budget) {
+                SLT_WRN(slot, "ssm-cache: snapshot %.1f MiB exceeds budget %d MiB; skipped\n",
+                        (float) sz / 1024 / 1024, params_base.ssm_cache_max_mib);
+                return;  // never keep an oversize blob
+            }
+            size_t resident = 0;
+            for (const auto & s : slot.ssm_snaps) { resident += s.data.capacity(); }
+            while (!slot.ssm_snaps.empty() && resident + sz > ssm_budget) {
+                const auto & victim = slot.ssm_snaps.front();
+                SLT_DBG(slot, "ssm-cache: evict snapshot pos=%d freed=%.1f KiB (budget=%d MiB)\n",
+                        victim.pos, (float) victim.data.capacity() / 1024, params_base.ssm_cache_max_mib);
+                resident -= victim.data.capacity();
+                slot.ssm_snaps.erase(slot.ssm_snaps.begin());
+            }
+        }
         server_slot::ssm_snapshot snap;
         snap.pos = pos;
         snap.data.resize(sz);
@@ -3894,7 +3925,7 @@ private:
                                 // both halves must be valid at the same position).
                                 llama_pos n_ssm = 0;
                                 const std::vector<uint8_t> * ssm_data = nullptr;
-                                if (params_base.ssm_cache && has_recur) {
+                                if (ssm_cache_active()) {
                                     for (const auto & snap : owner->ssm_snaps) {
                                         if (snap.pos <= best && snap.pos > n_ssm) { n_ssm = snap.pos; ssm_data = &snap.data; }
                                     }
@@ -4168,8 +4199,7 @@ private:
                     // checkpoint above) and labeled with the pre-batch position n_tokens_start, so it reflects
                     // exactly [0, n_tokens_start) processed tokens. spacing = ssm_cache_step. only for
                     // recurrent/hybrid models (per the model predicate); inert (no-op) for pure-attention.
-                    if (params_base.ssm_cache && !has_mtmd && pos_min >= 0 && n_tokens_start > 0 &&
-                            (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) &&
+                    if (ssm_cache_active() && !has_mtmd && pos_min >= 0 && n_tokens_start > 0 &&
                             (slot.ssm_snaps.empty() || n_tokens_start >= slot.ssm_snaps.back().pos + params_base.ssm_cache_step)) {
                         create_ssm_snapshot(slot, n_tokens_start);
                     }
