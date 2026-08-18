@@ -83,9 +83,11 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                      bool   kv_lazy,
-                     bool   kv_share) :
+                     bool   kv_share,
+  const llama_kv_layer_cfg_map * layer_cfg_ptr) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), kv_lazy(kv_lazy), kv_share(kv_share), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    layer_cfg(layer_cfg_ptr ? *layer_cfg_ptr : llama_kv_layer_cfg_map{}),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -105,15 +107,30 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer = hparams.n_layer_all;
 
+    // resolve the effective K/V type + window for a layer: explicit il entry > "*" entry > global default
+    struct eff_cfg_t { ggml_type tk; ggml_type tv; uint32_t window; };
+    auto eff_cfg = [&](uint32_t il) -> eff_cfg_t {
+        eff_cfg_t r = { type_k, type_v, 0 };
+        const auto apply = [&r](const llama_kv_layer_cfg & c) {
+            if (c.type_k != GGML_TYPE_COUNT) { r.tk = c.type_k; }
+            if (c.type_v != GGML_TYPE_COUNT) { r.tv = c.type_v; }
+            if (c.window != 0)               { r.window = c.window; }
+        };
+        if (const auto it = layer_cfg.find(LLAMA_KV_LAYER_ALL); it != layer_cfg.end()) { apply(it->second); }
+        if (const auto it = layer_cfg.find(il);                 it != layer_cfg.end()) { apply(it->second); }
+        return r;
+    };
+
     // logical KV bytes to store one token's cache (K+V across all attention KV layers; row size only, no paging).
     {
         const bool is_mla_pt = hparams.is_mla();
         for (uint32_t il = 0; il < n_layer; ++il) {
             if (!hparams.has_kv(il))   { continue; }
             if (filter && !filter(il)) { continue; }
-            n_bytes_per_token += ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+            const auto ec = eff_cfg(il);
+            n_bytes_per_token += ggml_row_size(ec.tk, hparams.n_embd_k_gqa(il));
             if (!is_mla_pt) {
-                n_bytes_per_token += ggml_row_size(type_v, !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max());
+                n_bytes_per_token += ggml_row_size(ec.tv, !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max());
             }
         }
     }
@@ -145,10 +162,10 @@ llama_kv_cache::llama_kv_cache(
                     throw std::runtime_error("kv-share requires --kv-lazy VMM buffers for all KV layers");
                 }
                 max_gran = std::max(max_gran, gran_l);
-                const size_t row_k = ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+                const size_t row_k = ggml_row_size(eff_cfg(il).tk, hparams.n_embd_k_gqa(il));
                 align_cells = std::lcm(align_cells, (uint32_t) (gran_l / std::gcd(row_k, gran_l)));
                 if (!is_mla_share) {
-                    const size_t row_v = ggml_row_size(type_v, hparams.n_embd_v_gqa(il));
+                    const size_t row_v = ggml_row_size(eff_cfg(il).tv, hparams.n_embd_v_gqa(il));
                     align_cells = std::lcm(align_cells, (uint32_t) (gran_l / std::gcd(row_v, gran_l)));
                 }
             }
@@ -262,7 +279,8 @@ llama_kv_cache::llama_kv_cache(
                 map_layer_ids[il] = layers.size();
 
                 layers.push_back(layer_share);
-                layers.back().il = il;
+                layers.back().il     = il;
+                layers.back().window = eff_cfg(il).window;
 
                 continue;
             }
@@ -316,8 +334,15 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        const auto ec = eff_cfg(il);
+        if (ec.tk != type_k || ec.tv != type_v || ec.window != 0) {
+            LLAMA_LOG_INFO("%s: layer %3d: K = %s, V = %s%s\n", __func__, il,
+                    ggml_type_name(ec.tk), ggml_type_name(ec.tv),
+                    ec.window ? (" (window = " + std::to_string(ec.window) + ")").c_str() : "");
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, ec.tk, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, ec.tv, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -332,7 +357,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, ec.window, k, v, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -357,6 +382,17 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
+    }
+
+    // collect the distinct non-zero attention windows (one KQ mask per class in the graph)
+    for (const auto & layer : layers) {
+        if (layer.window != 0 && std::find(window_classes.begin(), window_classes.end(), layer.window) == window_classes.end()) {
+            window_classes.push_back(layer.window);
+        }
+    }
+    if (!window_classes.empty()) {
+        std::sort(window_classes.begin(), window_classes.end());
+        GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_NONE && "per-layer windows cannot be combined with model SWA");
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -404,10 +440,19 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
+        // with per-layer overrides, enable the rotation if ANY layer's cache is quantized
+        // (the orthonormal rotation is exact, so applying it to f16 layers too is harmless)
+        bool any_k_quant = false;
+        bool any_v_quant = false;
+        for (const auto & layer : layers) {
+            any_k_quant |= layer.k && ggml_is_quantized(layer.k->type);
+            any_v_quant |= layer.v && ggml_is_quantized(layer.v->type);
+        }
+
         attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
-            ggml_is_quantized(type_k) &&
+            any_k_quant &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -419,7 +464,7 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
-            ggml_is_quantized(type_v) &&
+            any_v_quant &&
             hparams.n_embd_head_v() % 64 == 0;
     }
 
@@ -1821,7 +1866,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t window) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1836,13 +1881,16 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    // window > 0: per-layer ablation window, expressed as a standard SWA predicate
+    GGML_ASSERT(window == 0 || swa_type == LLAMA_SWA_TYPE_NONE);
+
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
         /*.v_cells          =*/ v_cells,
         /*.seq_to_stream    =*/ seq_to_stream,
-        /*.n_swa            =*/ n_swa,
-        /*.swa_type         =*/ swa_type,
+        /*.n_swa            =*/ window > 0 ? window : n_swa,
+        /*.swa_type         =*/ window > 0 ? LLAMA_SWA_TYPE_STANDARD : swa_type,
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
@@ -1857,6 +1905,15 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+uint32_t llama_kv_cache::get_window(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    return it != map_layer_ids.end() ? layers[it->second].window : 0;
+}
+
+const std::vector<uint32_t> & llama_kv_cache::get_window_classes() const {
+    return window_classes;
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -3082,8 +3139,16 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t window) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, window);
+}
+
+uint32_t llama_kv_cache_context::get_window(int32_t il) const {
+    return kv->get_window(il);
+}
+
+const std::vector<uint32_t> & llama_kv_cache_context::get_window_classes() const {
+    return kv->get_window_classes();
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

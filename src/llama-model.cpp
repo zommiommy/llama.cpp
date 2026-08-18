@@ -2345,7 +2345,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* kv_lazy           */ cparams.kv_lazy,
-                            /* kv_share          */ cparams.kv_share);
+                            /* kv_share          */ cparams.kv_share,
+                            /* layer_cfg         */ &params.layer_cfg);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2453,10 +2454,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 nullptr,
                                 cparams.kv_lazy,
-                                cparams.kv_share);
+                                cparams.kv_share,
+                                &params.layer_cfg);
                     }
                 }
             }
+    }
+
+    if (!params.layer_cfg.empty() && dynamic_cast<llama_kv_cache *>(res) == nullptr && dynamic_cast<llama_memory_hybrid *>(res) == nullptr) {
+        LLAMA_LOG_WARN("%s: --cache-layer overrides are only supported for plain and hybrid (non-iSWA) KV caches; ignored\n", __func__);
     }
 
     return res;

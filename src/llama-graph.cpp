@@ -466,6 +466,18 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+ggml_tensor * llm_graph_input_attn_kv::get_kq_mask(int il) const {
+    const uint32_t w = mctx->get_window(il);
+    if (w != 0) {
+        for (size_t i = 0; i < win_sizes.size(); ++i) {
+            if (win_sizes[i] == w) {
+                return win_kq_mask_cnv[i];
+            }
+        }
+    }
+    return self_kq_mask_cnv;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -474,6 +486,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    for (size_t i = 0; i < win_sizes.size(); ++i) {
+        if (win_kq_mask[i] && win_kq_mask[i]->buffer) {
+            mctx->set_input_kq_mask(win_kq_mask[i], ubatch, cparams.causal_attn, win_sizes[i]);
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -496,6 +514,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    for (size_t i = 0; i < win_kq_mask.size(); ++i) {
+        res &= can_reuse_kq_mask(win_kq_mask[i], mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -1063,7 +1085,16 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the dense mask can be a dead input when every layer has its own window class
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    for (size_t i = 0; i < inp_attn->win_sizes.size(); ++i) {
+        if (inp_attn->win_kq_mask[i] && inp_attn->win_kq_mask[i]->buffer) {
+            mctx->get_attn()->set_input_kq_mask(inp_attn->win_kq_mask[i], ubatch, cparams.causal_attn, inp_attn->win_sizes[i]);
+        }
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1097,6 +1128,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    for (size_t i = 0; i < inp_attn->win_kq_mask.size(); ++i) {
+        res &= can_reuse_kq_mask(inp_attn->win_kq_mask[i], mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2743,6 +2778,15 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        // one extra mask per distinct per-layer attention window (--cache-layer ":wN" ablation)
+        for (const uint32_t w : mctx_cur->get_window_classes()) {
+            ggml_tensor * m = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            ggml_format_name(m, "kq_mask_w%u", w);
+            inp->win_sizes.push_back(w);
+            inp->win_kq_mask.push_back(m);
+            inp->win_kq_mask_cnv.push_back(m);
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2801,7 +2845,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask(il);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

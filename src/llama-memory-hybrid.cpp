@@ -31,7 +31,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                      bool   kv_lazy,
-                     bool   kv_share) :
+                     bool   kv_share,
+  const llama_kv_layer_cfg_map * layer_cfg) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -53,7 +54,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         nullptr,
         kv_lazy,
-        kv_share  // attention KV page-shares like a plain kv_cache; the recurrent half is restored via the server SSM cache
+        kv_share, // attention KV page-shares like a plain kv_cache; the recurrent half is restored via the server SSM cache
+        layer_cfg
     )),
     mem_recr(new llama_memory_recurrent(
         model,

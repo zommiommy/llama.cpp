@@ -381,6 +381,13 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // per-layer KV cache overrides: comma-separated "IL=TYPEK[/TYPEV][:wN]" entries
+        // (e.g. "3=q8_0/q4_0,7=f16:w4096,*=q4_0"). "*" replaces the type_k/type_v default
+        // for every attention layer; explicit IL entries win over "*". ":wN" restricts that
+        // layer's attention to the last N tokens (mask-only; for ablation studies).
+        // NULL or empty = no overrides. [EXPERIMENTAL]
+        const char * cache_layers;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

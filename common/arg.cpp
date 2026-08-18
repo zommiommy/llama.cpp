@@ -2525,6 +2525,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--cache-layer"}, "SPEC",
+        "per-layer KV cache override(s): comma-separated \"IL=TYPEK[/TYPEV][:wN]\" entries\n"
+        "(e.g. \"3=q8_0/q4_0,7=f16:w4096,*=q4_0\"); \"IL\" is the model layer index, \"*\" sets\n"
+        "the default for all attention layers; \":wN\" restricts that layer's attention to the\n"
+        "last N tokens (mask-only, for ablation). repeatable; entries accumulate",
+        [](common_params & params, const std::string & value) {
+            if (!params.cache_layers.empty()) {
+                params.cache_layers += ",";
+            }
+            params.cache_layers += value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_LAYER"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

@@ -335,13 +335,20 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
+    // per-layer mask: dense by default; layers with an ablation window get their own mask class
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_kq_mask(int il) const;
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // extra mask classes for per-layer attention windows (parallel arrays, one per distinct window)
+    std::vector<uint32_t>      win_sizes;
+    std::vector<ggml_tensor *> win_kq_mask;
+    std::vector<ggml_tensor *> win_kq_mask_cnv;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;

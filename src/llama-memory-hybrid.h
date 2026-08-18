@@ -41,7 +41,8 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
                      bool   kv_lazy = false,
-                     bool   kv_share = false);
+                     bool   kv_share = false,
+  const llama_kv_layer_cfg_map * layer_cfg = nullptr);
 
     ~llama_memory_hybrid() = default;
 

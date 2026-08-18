@@ -391,10 +391,18 @@ llama_context::llama_context(
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
+            /*.layer_cfg =*/ {},
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+
+        if (params.cache_layers != nullptr && params.cache_layers[0] != '\0') {
+            std::string err;
+            if (!llama_kv_layer_cfg_parse(params.cache_layers, hparams.n_layer_all, params_mem.layer_cfg, err)) {
+                throw std::runtime_error("invalid --cache-layer spec: " + err);
+            }
+        }
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
@@ -3541,6 +3549,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.cache_layers                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
