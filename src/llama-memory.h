@@ -14,10 +14,29 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+// per-layer KV cache override (from llama_context_params.cache_layers)
+struct llama_kv_layer_cfg {
+    ggml_type type_k = GGML_TYPE_COUNT; // COUNT = inherit the global default
+    ggml_type type_v = GGML_TYPE_COUNT;
+    uint32_t  window = 0;               // 0 = dense; >0 = attend only to the last `window` tokens (mask-only)
+};
+
+// key for the wildcard ("*") entry
+static constexpr uint32_t LLAMA_KV_LAYER_ALL = UINT32_MAX;
+
+using llama_kv_layer_cfg_map = std::map<uint32_t, llama_kv_layer_cfg>;
+
+// parse a "IL=TYPEK[/TYPEV][:wN]" comma-separated spec (see llama_context_params.cache_layers).
+// n_layer bounds the valid IL range. returns false and sets `err` on malformed input.
+bool llama_kv_layer_cfg_parse(const char * spec, uint32_t n_layer, llama_kv_layer_cfg_map & out, std::string & err);
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
+
+    // per-layer overrides of type_k/type_v (+ optional attention window), key = il
+    llama_kv_layer_cfg_map layer_cfg;
 
     // use full-size SWA cache
     bool swa_full;
