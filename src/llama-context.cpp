@@ -229,9 +229,17 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = true;
-    cparams.auto_fgdn    = true;
+    // LLAMA_FUSED_GDN_DISABLE=1 forces the reference (non-fused) chunked DeltaNet path (debug/numerics)
+    {
+        const char * s = getenv("LLAMA_FUSED_GDN_DISABLE");
+        const bool fgdn_disable = s && atoi(s);
+        if (fgdn_disable) {
+            LLAMA_LOG_WARN("%s: fused gated-delta-net DISABLED (LLAMA_FUSED_GDN_DISABLE)\n", __func__);
+        }
+        cparams.fused_gdn_ar = !fgdn_disable;
+        cparams.fused_gdn_ch = !fgdn_disable;
+        cparams.auto_fgdn    = !fgdn_disable;
+    }
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
