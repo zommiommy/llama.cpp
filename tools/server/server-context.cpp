@@ -527,7 +527,7 @@ struct server_slot {
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d, KV+SSM state = %.1f MiB, total time = %.0f ms\n",
                     prompt.n_tokens(), truncated,
                     (prompt.n_tokens() * kv_bytes_per_token + rs_state_bytes) / 1024.0 / 1024.0,
-                    (ggml_time_us() - t_start_process_prompt) / 1e3);
+                    stats.t_elapsed_us() / 1e3);
 
             t_last_used = ggml_time_us();
 
@@ -884,11 +884,13 @@ private:
         int64_t suspended_at_us = 0; // park timestamp; resume is FCFS (oldest first) among equal priority
         std::unique_ptr<const server_task> task;
         common_sampler_ptr smpl;
-        server_prompt prompt; // prompt.data.{main,drft} holds the serialized tgt/dft KV blob
-        std::string disk_path;            // non-empty if the blob was spilled to disk (prompt.data cleared)
+        server_prompt prompt;
+        server_prompt_data data;          // serialized tgt/dft KV blob ({main,drft})
+        std::string disk_path;            // non-empty if the blob was spilled to disk (data cleared)
         size_t sz_main = 0, sz_drft = 0;  // serialized blob sizes (valid even when spilled)
         // generation-state snapshot (restored verbatim on unpark)
-        int32_t n_decoded = 0, n_prompt_tokens_cache = 0, n_prompt_tokens_processed = 0, n_decoded_last = 0;
+        server_slot_stats stats;
+        int32_t n_gen_last = 0;
         int32_t alora_invocation_start = -1;
         size_t  last_nl_pos = 0, n_sent_text = 0;
         std::string generated_text, stopping_word;
@@ -897,8 +899,6 @@ private:
         bool has_new_line = false, truncated = false;
         stop_type stop = STOP_TYPE_NONE;
         llama_token sampled = LLAMA_TOKEN_NULL;
-        int64_t t_start_generation = 0;
-        double t_prompt_processing = 0.0, t_token_generation = 0.0;
         std::vector<common_adapter_lora_info> lora;
     };
     std::vector<server_suspended> suspended; // parked requests awaiting resume (priority-ordered on pop)
@@ -933,7 +933,7 @@ private:
 
     size_t kv_swap_ram_used() const {
         size_t u = 0;
-        for (const auto & s : suspended) u += s.prompt.data.main.size() + s.prompt.data.drft.size();
+        for (const auto & s : suspended) u += s.data.main.size() + s.data.drft.size();
         return u;
     }
 
@@ -942,12 +942,12 @@ private:
         const std::string path = kv_swap_dir + "/kvswap-" + std::to_string(ggml_time_us()) + "-" + std::to_string((uintptr_t) &s) + ".bin";
         FILE * f = fopen(path.c_str(), "wb");
         if (!f) { SRV_WRN("kv-swap: cannot open spill file %s\n", path.c_str()); return; }
-        fwrite(s.prompt.data.main.data(), 1, s.prompt.data.main.size(), f);
-        fwrite(s.prompt.data.drft.data(), 1, s.prompt.data.drft.size(), f);
+        fwrite(s.data.main.data(), 1, s.data.main.size(), f);
+        fwrite(s.data.drft.data(), 1, s.data.drft.size(), f);
         fclose(f);
         s.disk_path = path;
-        s.prompt.data.main.clear(); s.prompt.data.main.shrink_to_fit();
-        s.prompt.data.drft.clear(); s.prompt.data.drft.shrink_to_fit();
+        s.data.main.clear(); s.data.main.shrink_to_fit();
+        s.data.drft.clear(); s.data.drft.shrink_to_fit();
         SRV_INF("kv-swap: spilled %.1f MiB to disk (%s)\n", (s.sz_main + s.sz_drft) / (1024.0*1024.0), path.c_str());
     }
 
@@ -955,10 +955,10 @@ private:
         if (s.disk_path.empty()) return true; // resident in RAM
         FILE * f = fopen(s.disk_path.c_str(), "rb");
         if (!f) { SRV_ERR("kv-swap: cannot reopen spill file %s\n", s.disk_path.c_str()); return false; }
-        s.prompt.data.main.resize(s.sz_main);
-        s.prompt.data.drft.resize(s.sz_drft);
-        const bool ok = fread(s.prompt.data.main.data(), 1, s.sz_main, f) == s.sz_main
-                     && fread(s.prompt.data.drft.data(), 1, s.sz_drft, f) == s.sz_drft;
+        s.data.main.resize(s.sz_main);
+        s.data.drft.resize(s.sz_drft);
+        const bool ok = fread(s.data.main.data(), 1, s.sz_main, f) == s.sz_main
+                     && fread(s.data.drft.data(), 1, s.sz_drft, f) == s.sz_drft;
         fclose(f);
         if (!ok) { SRV_ERR("kv-swap: short read from spill file %s\n", s.disk_path.c_str()); return false; }
         remove(s.disk_path.c_str());
@@ -974,7 +974,7 @@ private:
             server_suspended * t = nullptr;
             for (auto & s : suspended) {
                 if (!s.disk_path.empty()) continue;
-                if (s.prompt.data.main.empty() && s.prompt.data.drft.empty()) continue;
+                if (s.data.main.empty() && s.data.drft.empty()) continue;
                 if (!t || s.priority < t->priority) t = &s; // spill lowest-priority resident first
             }
             if (!t) break;
@@ -989,33 +989,30 @@ private:
         s.suspended_at_us = ggml_time_us();
 
         const size_t sz_main = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        s.prompt.data.main.resize(sz_main);
-        llama_state_seq_get_data_ext(slot.ctx_tgt, s.prompt.data.main.data(), sz_main, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        s.data.main.resize(sz_main);
+        llama_state_seq_get_data_ext(slot.ctx_tgt, s.data.main.data(), sz_main, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (slot.ctx_dft) {
             const size_t sz_dft = llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            s.prompt.data.drft.resize(sz_dft);
-            llama_state_seq_get_data_ext(slot.ctx_dft, s.prompt.data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            s.data.drft.resize(sz_dft);
+            llama_state_seq_get_data_ext(slot.ctx_dft, s.data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
         SLT_INF(slot, "kv-swap: PARKED (priority=%d, %d tokens, frees ~%.1f MiB GPU KV+SSM, blob=%.1f MiB to RAM, %zu suspended)\n",
                 s.priority, slot.prompt.n_tokens(),
                 (slot.prompt.n_tokens() * slot.kv_bytes_per_token + slot.rs_state_bytes) / (1024.0*1024.0),
-                (s.prompt.data.main.size() + s.prompt.data.drft.size()) / (1024.0*1024.0), suspended.size() + 1);
+                (s.data.main.size() + s.data.drft.size()) / (1024.0*1024.0), suspended.size() + 1);
 
         s.task = std::move(slot.task);
         s.smpl = std::move(slot.smpl);
         s.prompt.tokens = slot.prompt.tokens.clone();
-        s.n_decoded = slot.n_decoded; s.n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
-        s.n_prompt_tokens_processed = slot.n_prompt_tokens_processed; s.n_decoded_last = slot.n_decoded_last;
+        s.stats = slot.stats; s.n_gen_last = slot.n_gen_last;
         s.alora_invocation_start = slot.alora_invocation_start; s.last_nl_pos = slot.last_nl_pos;
         s.n_sent_text = slot.n_sent_text; s.generated_text = slot.generated_text; s.stopping_word = slot.stopping_word;
         s.generated_tokens = slot.generated_tokens; s.generated_token_probs = slot.generated_token_probs;
         s.has_new_line = slot.has_new_line; s.truncated = slot.truncated; s.stop = slot.stop; s.sampled = slot.sampled;
-        s.t_start_generation = slot.t_start_generation; s.t_prompt_processing = slot.t_prompt_processing;
-        s.t_token_generation = slot.t_token_generation; s.lora = slot.lora;
+        s.lora = slot.lora;
 
-        common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
-        if (slot.ctx_dft) common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+        slot.mem.seq_rm(slot.id, -1, -1);
         slot.state = SLOT_STATE_IDLE;
         // leave the freed slot as clean as release()->reset(), but WITHOUT finalizing the response
         // (task/smpl/gen-state were moved into `s`; reset() clears the reusable slot fields + unbinds sampler)
@@ -1023,12 +1020,11 @@ private:
         slot.prompt.tokens.clear();
         slot.ssm_snaps.clear();
         // counters reset() does not clear, else the next task assigned here inherits stale values
-        slot.n_decoded = 0; slot.n_decoded_last = 0; slot.n_prompt_tokens_processed = 0;
+        slot.stats = {}; slot.n_gen_last = 0;
         slot.i_batch = -1;
-        slot.t_start_generation = 0; slot.t_prompt_processing = 0; slot.t_token_generation = 0;
         slot.t_last_used = ggml_time_us();
-        s.sz_main = s.prompt.data.main.size();
-        s.sz_drft = s.prompt.data.drft.size();
+        s.sz_main = s.data.main.size();
+        s.sz_drft = s.data.drft.size();
         suspended.push_back(std::move(s));
         kv_swap_maybe_spill();
         slot.callback_on_release(slot.id);
@@ -1037,12 +1033,12 @@ private:
     // restore a parked request into a free slot and continue generating to the same task id
     void kv_swap_unpark(server_suspended && s, server_slot & slot) {
         const bool loaded  = kv_swap_load(s);
-        const bool has_dft = slot.ctx_dft && !s.prompt.data.drft.empty();
+        const bool has_dft = slot.ctx_dft && !s.data.drft.empty();
         size_t r_main = 0, r_drft = 0;
         if (loaded) {
-            r_main = llama_state_seq_set_data_ext(slot.ctx_tgt, s.prompt.data.main.data(), s.prompt.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            r_main = llama_state_seq_set_data_ext(slot.ctx_tgt, s.data.main.data(), s.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (has_dft) {
-                r_drft = llama_state_seq_set_data_ext(slot.ctx_dft, s.prompt.data.drft.data(), s.prompt.data.drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                r_drft = llama_state_seq_set_data_ext(slot.ctx_dft, s.data.drft.data(), s.data.drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
             }
         }
         const bool restore_ok = loaded && r_main > 0 && (!has_dft || r_drft > 0);
@@ -1050,24 +1046,19 @@ private:
         slot.task = std::move(s.task);
         slot.smpl = std::move(s.smpl);
         slot.prompt = std::move(s.prompt);
-        slot.prompt.data.main.clear(); slot.prompt.data.main.shrink_to_fit();
-        slot.prompt.data.drft.clear(); slot.prompt.data.drft.shrink_to_fit();
-        slot.n_decoded = s.n_decoded; slot.n_prompt_tokens_cache = s.n_prompt_tokens_cache;
-        slot.n_prompt_tokens_processed = s.n_prompt_tokens_processed; slot.n_decoded_last = s.n_decoded_last;
+        slot.stats = s.stats; slot.n_gen_last = s.n_gen_last;
         slot.alora_invocation_start = s.alora_invocation_start; slot.last_nl_pos = s.last_nl_pos;
         slot.n_sent_text = s.n_sent_text; slot.generated_text = s.generated_text; slot.stopping_word = s.stopping_word;
         slot.generated_tokens = s.generated_tokens; slot.generated_token_probs = s.generated_token_probs;
         slot.has_new_line = s.has_new_line; slot.truncated = s.truncated; slot.stop = s.stop; slot.sampled = s.sampled;
-        slot.t_start_generation = s.t_start_generation; slot.t_prompt_processing = s.t_prompt_processing;
-        slot.t_token_generation = s.t_token_generation; slot.lora = s.lora;
+        slot.lora = s.lora;
         slot.i_batch = -1;
         slot.state = SLOT_STATE_GENERATING;
-        slot.kv_swap_resume_n_decoded = slot.n_decoded; // start the post-resume min-residency window
+        slot.kv_swap_resume_n_decoded = (int32_t) slot.stats.n_gen; // start the post-resume min-residency window
 
         if (!restore_ok) {
             SLT_ERR(slot, "%s", "kv-swap: failed to restore suspended state; aborting request\n");
-            common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
-            if (slot.ctx_dft) common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+            slot.mem.seq_rm(slot.id, -1, -1);
             send_error(slot, "failed to restore suspended request (kv-swap)", ERROR_TYPE_SERVER);
             slot.release();
             return;
@@ -1120,7 +1111,7 @@ private:
             for (auto & s : slots) {
                 if (!kv_swap_park_eligible(s)) continue;
                 n_active++;
-                if (s.kv_swap_resume_n_decoded >= 0 && (s.n_decoded - s.kv_swap_resume_n_decoded) < KV_PARK_MIN_RESIDENCY_TOKENS) continue;
+                if (s.kv_swap_resume_n_decoded >= 0 && ((int32_t) s.stats.n_gen - s.kv_swap_resume_n_decoded) < KV_PARK_MIN_RESIDENCY_TOKENS) continue;
                 if (!victim) { victim = &s; continue; }
                 const int pv = victim->task->params.priority, ps = s.task->params.priority;
                 if (ps < pv || (ps == pv && s.prompt.n_tokens() > victim->prompt.n_tokens())) victim = &s;
@@ -1146,7 +1137,7 @@ private:
         }
         slot.state = SLOT_STATE_GENERATING;
         slot.kv_park_evicted_bytes = 0;
-        slot.kv_swap_resume_n_decoded = slot.n_decoded; // start the post-resume min-residency window
+        slot.kv_swap_resume_n_decoded = (int32_t) slot.stats.n_gen; // start the post-resume min-residency window
         SLT_INF(slot, "kv-park: RESUMED (priority=%d)\n", slot.kv_park_priority);
         return true;
     }
@@ -1159,10 +1150,7 @@ private:
         if (!b || b->borrowed_from < 0) {
             return;
         }
-        common_context_seq_rm(b->ctx_tgt, b->id, 0, -1);
-        if (b->ctx_dft) {
-            common_context_seq_rm(b->ctx_dft, b->id, 0, -1);
-        }
+        b->mem.seq_rm(b->id, 0, -1);
         b->prompt.tokens.keep_first(0);
         for (auto & s : slots) {
             if (s.id == b->borrowed_from) {
@@ -1219,7 +1207,7 @@ private:
         for (auto & s : slots) {
             if (!kv_swap_park_eligible(s)) continue;
             n_active++;
-            if (s.kv_swap_resume_n_decoded >= 0 && (s.n_decoded - s.kv_swap_resume_n_decoded) < MIN_RESIDENCY_TOKENS) continue;
+            if (s.kv_swap_resume_n_decoded >= 0 && ((int32_t) s.stats.n_gen - s.kv_swap_resume_n_decoded) < MIN_RESIDENCY_TOKENS) continue;
             if (!victim) { victim = &s; continue; }
             const int pv = victim->task->params.priority, ps = s.task->params.priority;
             if (ps < pv || (ps == pv && s.prompt.n_tokens() > victim->prompt.n_tokens())) victim = &s;
