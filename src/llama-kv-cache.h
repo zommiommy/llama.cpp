@@ -242,6 +242,11 @@ public:
 
     // per-layer attention window (0 = dense) and the set of distinct non-zero windows
     uint32_t get_window(int32_t il) const;
+
+    // per-layer Hadamard rotation (QuaRot) state: whether this layer's Q/K (resp. V)
+    // are rotated before the cache write (and the attention output un-rotated)
+    bool get_rot_k(int32_t il) const;
+    bool get_rot_v(int32_t il) const;
     const std::vector<uint32_t> & get_window_classes() const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -259,6 +264,10 @@ private:
 
         // attention window for this layer (0 = dense); mask-only, used for ablation
         uint32_t window = 0;
+
+        // Hadamard rotation applied to this layer's K (with Q) and V (see attn_rot_*)
+        bool rot_k = false;
+        bool rot_v = false;
 
         ggml_tensor * k;
         ggml_tensor * v;
@@ -452,6 +461,9 @@ public:
 
     uint32_t get_window(int32_t il) const;
     const std::vector<uint32_t> & get_window_classes() const;
+
+    bool get_rot_k(int32_t il) const;
+    bool get_rot_v(int32_t il) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

@@ -2818,12 +2818,17 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
+    // per-layer rotation flags: the rotation inputs exist when ANY layer rotates,
+    // but each layer applies them only if its own cache is configured to rotate
+    const bool rot_k_l = inp->self_k_rot && inp->mctx->get_rot_k(il);
+    const bool rot_v_l = inp->self_v_rot && inp->mctx->get_rot_v(il);
+
+    if (rot_k_l) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
-    if (inp->self_v_rot) {
+    if (rot_v_l) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
@@ -2854,7 +2859,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
+    if (rot_v_l) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 

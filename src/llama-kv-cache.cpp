@@ -107,19 +107,31 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer = hparams.n_layer_all;
 
-    // resolve the effective K/V type + window for a layer: explicit il entry > "*" entry > global default
-    struct eff_cfg_t { ggml_type tk; ggml_type tv; uint32_t window; };
+    // resolve the effective K/V type + window + rotation for a layer: explicit il entry > "*" entry > global default
+    struct eff_cfg_t { ggml_type tk; ggml_type tv; uint32_t window; int8_t rot; };
     auto eff_cfg = [&](uint32_t il) -> eff_cfg_t {
-        eff_cfg_t r = { type_k, type_v, 0 };
+        eff_cfg_t r = { type_k, type_v, 0, -1 };
         const auto apply = [&r](const llama_kv_layer_cfg & c) {
             if (c.type_k != GGML_TYPE_COUNT) { r.tk = c.type_k; }
             if (c.type_v != GGML_TYPE_COUNT) { r.tv = c.type_v; }
             if (c.window != 0)               { r.window = c.window; }
+            if (c.rot != -1)                 { r.rot = c.rot; }
         };
         if (const auto it = layer_cfg.find(LLAMA_KV_LAYER_ALL); it != layer_cfg.end()) { apply(it->second); }
         if (const auto it = layer_cfg.find(il);                 it != layer_cfg.end()) { apply(it->second); }
         return r;
     };
+
+    const char * ATTN_ROT_DISABLE_ENV = getenv("LLAMA_ATTN_ROT_DISABLE");
+    const bool attn_rot_disable = ATTN_ROT_DISABLE_ENV ? atoi(ATTN_ROT_DISABLE_ENV) : false;
+    if (attn_rot_disable && !other) {
+        LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+    }
+
+    // DeepSeek lightning indexers always rotate K (quantized-indexer conditioning)
+    const bool attn_rot_force_k =
+        (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_GLM_DSA) &&
+        hparams.n_embd_head_k_full == hparams.indexer_head_size;
 
     // logical KV bytes to store one token's cache (K+V across all attention KV layers; row size only, no paging).
     {
@@ -335,9 +347,26 @@ llama_kv_cache::llama_kv_cache(
         const bool has_v = !is_mla;
 
         const auto ec = eff_cfg(il);
-        if (ec.tk != type_k || ec.tv != type_v || ec.window != 0) {
-            LLAMA_LOG_INFO("%s: layer %3d: K = %s, V = %s%s\n", __func__, il,
-                    ggml_type_name(ec.tk), ggml_type_name(ec.tv),
+
+        // per-layer Hadamard rotation: explicit :rot/:norot wins; auto = rotate iff this
+        // layer's cache type is quantized (rotating f16 layers only adds rounding noise)
+        const bool dims_ok_k = hparams.n_embd_head_k(il) % 64 == 0 && hparams.n_embd_head_k(il) >= 64;
+        const bool dims_ok_v = hparams.n_embd_head_v(il) % 64 == 0 && hparams.n_embd_head_v(il) >= 64;
+        bool rot_k_l, rot_v_l;
+        if (attn_rot_disable) {
+            rot_k_l = rot_v_l = false;
+        } else if (ec.rot != -1) {
+            rot_k_l = ec.rot && dims_ok_k;
+            rot_v_l = ec.rot && dims_ok_v && has_v;
+        } else {
+            rot_k_l = dims_ok_k && ggml_is_quantized(ec.tk);
+            rot_v_l = dims_ok_v && has_v && ggml_is_quantized(ec.tv);
+        }
+        rot_k_l = rot_k_l || attn_rot_force_k;
+
+        if (ec.tk != type_k || ec.tv != type_v || ec.window != 0 || ec.rot != -1) {
+            LLAMA_LOG_INFO("%s: layer %3d: K = %s, V = %s, rot = %d/%d%s\n", __func__, il,
+                    ggml_type_name(ec.tk), ggml_type_name(ec.tv), (int) rot_k_l, (int) rot_v_l,
                     ec.window ? (" (window = " + std::to_string(ec.window) + ")").c_str() : "");
         }
 
@@ -357,7 +386,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, ec.window, k, v, k_stream, v_stream, });
+        layers.push_back({ il, ec.window, rot_k_l, rot_v_l, k, v, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -434,38 +463,21 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
     } else {
-        const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-        const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
-        if (attn_rot_disable) {
-            LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+        // the Hadamard matrices are precomputed per uniform head size; without one, no rotation
+        if (n_embd_head_k_all <= 0 || n_embd_head_v_all <= 0) {
+            for (auto & layer : layers) {
+                if (n_embd_head_k_all <= 0) { layer.rot_k = attn_rot_force_k; }
+                if (n_embd_head_v_all <= 0) { layer.rot_v = false; }
+            }
         }
 
-        // with per-layer overrides, enable the rotation if ANY layer's cache is quantized
-        // (the orthonormal rotation is exact, so applying it to f16 layers too is harmless)
-        bool any_k_quant = false;
-        bool any_v_quant = false;
+        // global flags = "any layer rotates": gate the rotation graph inputs + matrix precompute
+        attn_rot_k = false;
+        attn_rot_v = false;
         for (const auto & layer : layers) {
-            any_k_quant |= layer.k && ggml_is_quantized(layer.k->type);
-            any_v_quant |= layer.v && ggml_is_quantized(layer.v->type);
+            attn_rot_k |= layer.rot_k;
+            attn_rot_v |= layer.rot_v;
         }
-
-        attn_rot_k =
-            !attn_rot_disable &&
-            n_embd_head_k_all > 0 &&
-            any_k_quant &&
-            hparams.n_embd_head_k() % 64 == 0;
-
-        // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_GLM_DSA) &&
-                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-            attn_rot_k = true;
-        }
-
-        attn_rot_v =
-            !attn_rot_disable &&
-            n_embd_head_v_all > 0 &&
-            any_v_quant &&
-            hparams.n_embd_head_v() % 64 == 0;
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
@@ -1916,6 +1928,16 @@ const std::vector<uint32_t> & llama_kv_cache::get_window_classes() const {
     return window_classes;
 }
 
+bool llama_kv_cache::get_rot_k(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    return it != map_layer_ids.end() && layers[it->second].rot_k;
+}
+
+bool llama_kv_cache::get_rot_v(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    return it != map_layer_ids.end() && layers[it->second].rot_v;
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -3145,6 +3167,14 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 uint32_t llama_kv_cache_context::get_window(int32_t il) const {
     return kv->get_window(il);
+}
+
+bool llama_kv_cache_context::get_rot_k(int32_t il) const {
+    return kv->get_rot_k(il);
+}
+
+bool llama_kv_cache_context::get_rot_v(int32_t il) const {
+    return kv->get_rot_v(il);
 }
 
 const std::vector<uint32_t> & llama_kv_cache_context::get_window_classes() const {
