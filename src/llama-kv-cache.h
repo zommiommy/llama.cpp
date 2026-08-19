@@ -288,6 +288,10 @@ private:
         // attention window for this layer (0 = dense); mask-only, used for ablation
         uint32_t window = 0;
 
+        // Hadamard rotation applied to this layer's K (with Q) and V (see attn_rot_*)
+        bool rot_k = false;
+        bool rot_v = false;
+
         ggml_tensor * k;
         ggml_tensor * v;
 
