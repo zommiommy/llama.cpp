@@ -27,7 +27,7 @@ run() { # $1 = label, $2 = --cache-layer spec ("" = none)
     fi
     local log rc kld same dppl
     set +e
-    log=$("$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on \
+    log=$("$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on --parse-special \
           --kl-divergence-base "$KLD_BASE" --kl-divergence "${extra[@]}" 2>&1 | tail -60)
     rc=$?
     set -e
@@ -48,20 +48,24 @@ echo "config,mean_kld,kld_err,same_top_pct,d_ppl" | tee -a "$OUT"
 # baseline pass: saves the full-precision (unablated) logits
 if [ ! -f "$KLD_BASE" ]; then
     echo "# saving baseline logits to $KLD_BASE ..." >&2
-    "$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on \
+    "$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on --parse-special \
         --kl-divergence-base "$KLD_BASE" 2>&1 | grep -E 'Final estimate|ETA' | tail -1 >&2
 fi
 
 run "self_check_f16" ""                 # KLD of baseline vs itself: must be ~0
-run "all_q4"         "*=q4_0/q4_0"
-run "all_w${WINDOW}" "*=f16:w${WINDOW}"
 
-for il in $LAYERS; do
-    run "quant_l${il}" "${il}=q4_0/q4_0"
-done
+if [ "${SWEEP:-both}" != "window" ]; then
+    run "all_q4" "*=q4_0/q4_0"
+    for il in $LAYERS; do
+        run "quant_l${il}" "${il}=q4_0/q4_0"
+    done
+fi
 
-for il in $LAYERS; do
-    run "window_l${il}" "${il}=f16:w${WINDOW}"
-done
+if [ "${SWEEP:-both}" != "quant" ]; then
+    run "all_w${WINDOW}" "*=f16:w${WINDOW}"
+    for il in $LAYERS; do
+        run "window_l${il}" "${il}=f16:w${WINDOW}"
+    done
+fi
 
 echo "done -> $OUT"
