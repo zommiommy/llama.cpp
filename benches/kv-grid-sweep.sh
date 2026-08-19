@@ -20,7 +20,7 @@ run() { # $1 = label, $2 = --cache-layer spec
     fi
     local log rc kld
     set +e
-    log=$("$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on \
+    log=$("$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on --parse-special \
           --kl-divergence-base "$KLD_BASE" --kl-divergence --cache-layer "$2" 2>&1 | tail -60)
     rc=$?
     set -e
@@ -40,7 +40,7 @@ fi
 
 if [ ! -f "$KLD_BASE" ]; then
     echo "# saving baseline logits to $KLD_BASE ..." >&2
-    "$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on \
+    "$BIN" -m "$MODEL" -f "$CORPUS" -c "$CTX" --chunks "$CHUNKS" -fa on --parse-special \
         --kl-divergence-base "$KLD_BASE" 2>&1 | grep -E 'Final estimate' | tail -1 >&2
 fi
 
