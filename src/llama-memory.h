@@ -19,6 +19,7 @@ struct llama_kv_layer_cfg {
     ggml_type type_k = GGML_TYPE_COUNT; // COUNT = inherit the global default
     ggml_type type_v = GGML_TYPE_COUNT;
     uint32_t  window = 0;               // 0 = dense; >0 = attend only to the last `window` tokens (mask-only)
+    int8_t    rot    = -1;              // Hadamard (QuaRot) rotation: -1 = auto (iff this layer's cache is quantized), 0 = off, 1 = on
 };
 
 // key for the wildcard ("*") entry
