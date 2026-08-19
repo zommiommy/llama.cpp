@@ -12,10 +12,10 @@ Anchors default to the uniform configs measured on TC-Qwen3.6 @32K (omp corpus).
 NixOS: run under `nix-shell -p python3Packages.matplotlib` if needed.
 """
 import argparse, json, os, sys
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 DEF_ANCHORS = "KQ8VQ8:34816:0.782,KQ8VQ4:26624:1.245,uniform q5_1:24576:1.098,uniform q4_0:18432:1.836"
 
@@ -42,11 +42,31 @@ def main() -> None:
     klds  = [0.0]            + [s["kld"]      for s in steps]
 
     fig, ax = plt.subplots(figsize=(9, 6))
+    ax.set_title("Measured greedy KV-precision descent (per-tensor, per-layer)")
     ax.plot([s / 1024 for s in sizes], klds, marker=".", ms=4, lw=1.2,
             color="tab:blue", label=f"measured greedy path ({len(steps)} steps)")
 
     # mark level transitions of note: first time each layer-band is touched
     last = steps[-1]
+
+    # log-linear regression: ln(KLD) = a * size + b, fitted on points above the
+    # measurement noise floor (KLD > 1e-3); i.e. KLD grows exponentially as the
+    # cache shrinks. Extrapolated across the full x range (dashed).
+    xs = np.array(sizes[1:]); ys = np.array(klds[1:])
+    mask = ys > 1e-3
+    if mask.sum() >= 3:
+        a, b = np.polyfit(xs[mask], np.log(ys[mask]), 1)
+        pred = a * xs[mask] + b
+        ss_res = float(np.sum((np.log(ys[mask]) - pred) ** 2))
+        ss_tot = float(np.sum((np.log(ys[mask]) - np.log(ys[mask]).mean()) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        xfit = np.linspace(min(xs.min(), 18432), args.f16_size, 200)
+        ax.plot(xfit / 1024, np.exp(a * xfit + b), "--", lw=1.0, color="tab:green",
+                label=f"log-linear fit: KLD = exp({a*1024:.3f}·KiB {b:+.2f}), R²={r2:.3f}")
+        # halving distance: bytes of cache that double the KLD
+        if a < 0:
+            ax.set_title(f"Measured greedy KV-precision descent — KLD doubles every "
+                         f"{-np.log(2)/a/1024:.2f} KiB/token removed")
     ax.annotate(f'step {last["step"]}: {last["key"][0]}{last["key"][1]}→{last["to"]}',
                 xy=(last["size_bpt"] / 1024, last["kld"]),
                 xytext=(6, 6), textcoords="offset points", fontsize=8, color="tab:blue")
@@ -63,7 +83,6 @@ def main() -> None:
         ax.set_yscale("symlog", linthresh=1e-3)
     ax.set_xlabel("KV cache size (KiB / token)")
     ax.set_ylabel("mean KLD vs f16 baseline")
-    ax.set_title("Measured greedy KV-precision descent (per-tensor, per-layer)")
     ax.grid(True, which="both", alpha=0.3)
     ax.invert_xaxis()  # descent reads left→right
     ax.legend(loc="upper left")
