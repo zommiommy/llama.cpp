@@ -60,21 +60,32 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
     return false;
 }
 
-// parse one "TYPEK[/TYPEV][:wN]" fragment into cfg
+// parse one "TYPEK[/TYPEV][:wN][:rot|:norot]" fragment into cfg
 static bool llama_kv_layer_cfg_parse_one(const std::string & s, llama_kv_layer_cfg & cfg, std::string & err) {
-    std::string rest = s;
+    // split off the ':'-separated suffix options; the leading part is the type spec
+    size_t colon = s.find(':');
+    std::string rest = s.substr(0, colon == std::string::npos ? s.size() : colon);
 
-    const size_t wpos = rest.find(":w");
-    if (wpos != std::string::npos) {
-        const std::string wstr = rest.substr(wpos + 2);
-        rest = rest.substr(0, wpos);
-        char * end = nullptr;
-        const unsigned long w = strtoul(wstr.c_str(), &end, 10);
-        if (wstr.empty() || (end && *end != '\0')) {
-            err = "bad window '" + wstr + "'";
+    while (colon != std::string::npos) {
+        const size_t next = s.find(':', colon + 1);
+        const std::string opt = s.substr(colon + 1, (next == std::string::npos ? s.size() : next) - colon - 1);
+        if (opt.size() > 1 && opt[0] == 'w') {
+            char * end = nullptr;
+            const unsigned long w = strtoul(opt.c_str() + 1, &end, 10);
+            if (end && *end != '\0') {
+                err = "bad window '" + opt + "'";
+                return false;
+            }
+            cfg.window = (uint32_t) w;
+        } else if (opt == "rot") {
+            cfg.rot = 1;
+        } else if (opt == "norot") {
+            cfg.rot = 0;
+        } else {
+            err = "unknown option ':" + opt + "'";
             return false;
         }
-        cfg.window = (uint32_t) w;
+        colon = next;
     }
 
     auto parse_type = [&](const std::string & name, ggml_type & t) {
