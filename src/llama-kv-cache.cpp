@@ -3364,6 +3364,10 @@ bool llama_kv_cache_context::apply() {
     return true;
 }
 
+bool llama_kv_cache_context::ensure_window() const {
+    return ubatches.empty() || kv->ensure_kv_window(sinfos[i_cur]);
+}
+
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }

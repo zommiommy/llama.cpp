@@ -456,6 +456,11 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    // --kv-lazy: commit the pages apply() will write for the current ubatch without applying it, so a memory
+    // built from several caches can commit all of them before any cell metadata changes.
+    // true when there is nothing to commit (an update context, or a cache that is not lazy)
+    bool ensure_window() const;
+
     uint32_t get_n_kv() const;
 
     ggml_type type_k() const;

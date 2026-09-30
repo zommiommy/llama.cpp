@@ -39,7 +39,9 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                            /* demand-page the attention, indexer and recurrent caches (--kv-lazy) */
+                     bool   kv_lazy);
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -65,6 +67,9 @@ public:
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    // the base counts only the attention KV; each token also stores one indexer key
+    size_t kv_size_per_token() const override;
 
     // state write/load
 

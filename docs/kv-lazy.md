@@ -156,7 +156,12 @@ keys have slid out is a silent correctness hazard. The server logs
 
 - **Applies to** standard attention (`llama_kv_cache`), hybrid
   (`llama_memory_hybrid`), and recurrent (`llama_memory_recurrent`) caches — i.e.
-  the large, unbounded-context caches lazy growth is designed for.
+  the large, unbounded-context caches lazy growth is designed for — and to the
+  sparse-attention hybrid (`llama_memory_hybrid_idx`, qwen4exp / Qwen3.8-Flash-Next),
+  whose attention KV, per-token indexer keys and recurrent state (PLE conv-history
+  rows included) all commit on demand. `--kv-share` stays off for that cache: the
+  inherited prefix aliasing would share attention pages without their indexer keys.
+  kv-swap's partial eviction (`seq_evict`) reclaims only its attention pages.
 - **Strong lazy-V assumes `-fa on`**: with FlashAttention the V cache is contiguous
   per-token rows, so it commits exactly `[0, n_kv)` like K. Without FlashAttention V
   is transposed (a token spans one column across all rows), so `ensure_kv_window()`
@@ -248,6 +253,37 @@ a dual-GPU or full-GPU-offload result.
   the card's 12282 MiB; lazy leaves ~2.9 GB headroom). The saving tracks context
   size (`kv_unified=false`, n_seq_max=1 here); a separate npl=8 run at 32K showed a
   smaller gap dominated by the larger batch compute buffer, not KV.
+
+### Measured locally — Qwen3.8-Flash-Next UD-IQ4_XS, RTX 4090 (24 GB)
+
+`-ngl 999 --n-cpu-moe 44 -fa on -ctk q8_0 -ctv q8_0 -np 1`, `-b`/`-ub` 2048 unless
+noted; arch `qwen4exp` (48 layers: QSA sparse attention over a per-token indexer cache,
+plus gated-DeltaNet recurrent state with a PLE conv-history row; 512 experts / 10 used,
+the first 44 layers' experts in host RAM). The server logs 14.3 KiB/token of KV
+(attention + indexer) and 112.6 MiB/sequence of recurrent state.
+
+- **Correctness — PASS.** `--temp 0 --top-k 1`, ctx 131072: a 19.3K-token needle prompt
+  and a 300-token generation are byte-identical with and without `--kv-lazy`.
+- **Watermark and prefill — no `--kv-lazy` cost.** GPU MiB above the desktop's ~2.6 GiB
+  after load, and prefill t/s of one 19,347-token prompt sent twice with
+  `cache_prompt: false` (first request / second, page-cache-warm request):
+
+  | ctx    | `-b`/`-ub` | eager VRAM  | eager prefill | lazy VRAM | lazy prefill  |
+  |--------|------------|-------------|---------------|-----------|---------------|
+  | 131072 | 2048       | 16427       | 538.0 / 601.6 | 14445     | 563.6 / 573.8 |
+  | 262144 | 2048       | OOM at load | —             | 17899     | 543.3 / 597.9 |
+  | 262144 | 1536       | —           | —             | 16204     | 471.2 / 466.2 |
+  | 262144 | 1024       | —           | —             | 14350     | 369.5 / 379.6 |
+
+  Eager at 262144 cannot allocate its 7428 MiB compute buffer next to the whole-context
+  KV: the QSA bias and indexer scores are f32 `n_kv x n_ubatch`, so the compute buffer
+  grows with both ctx and `-ub`. Eager and lazy trade places between the two requests, so
+  their gap is noise: committing each ubatch's window costs nothing measurable, and a
+  larger ctx costs nothing either. The batch size does: with `--n-cpu-moe 44` every ubatch
+  streams the host-resident experts to the GPU, so smaller ubatches mean more passes.
+- **Long context — PASS.** ctx 262144: a 152657-token needle prompt prefills at 555 t/s,
+  answers correctly, and commits KV as it goes (+2.1 GiB); decode at that depth is
+  17.3 t/s (23-25 t/s near empty).
 
 ### Still deferred to the dual-GPU rig (RTX 4090 + 4070S)
 
