@@ -295,6 +295,7 @@ void llama_memory_recurrent::release_empty_cells() {
             for (size_t il = 0; il < r_l.size(); ++il) {
                 release_row(r_l[il], row);
                 release_row(s_l[il], row);
+                release_row(p_l[il], row);
             }
         }
     }
@@ -796,6 +797,10 @@ bool llama_memory_recurrent::ensure_state_window() {
                 return false;
             }
             if (!ensure_rows(s_l[il], row0, nrows)) {
+                return false;
+            }
+            // the PLE conv history (qwen4exp) is a third per-cell row the graph gathers and writes
+            if (!ensure_rows(p_l[il], row0, nrows)) {
                 return false;
             }
         }
