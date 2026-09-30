@@ -58,7 +58,7 @@ public:
     // bytes of the recurrent/SSM state for one sequence (one rollback group); fixed, does not grow with tokens.
     size_t rs_state_size() const override {
         const size_t groups = (size_t) size * (1 + n_rs_seq);
-        return groups ? (size_r_bytes() + size_s_bytes()) / groups : 0;
+        return groups ? (size_r_bytes() + size_s_bytes() + size_p_bytes()) / groups : 0;
     }
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
