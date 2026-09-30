@@ -3100,6 +3100,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 
+                if (cparams.kv_share) {
+                    LLAMA_LOG_WARN("%s: --kv-share is not supported for the sparse-attention hybrid cache; slots will not share prefixes\n", __func__);
+                }
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
                     /* no_alloc          */ params.no_alloc,
@@ -3118,7 +3121,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
                     /* filter_recr       */ std::move(filter_recr),
-                    /* filter_idx        */ std::move(filter_idx));
+                    /* filter_idx        */ std::move(filter_idx),
+                    /* kv_lazy           */ cparams.kv_lazy);
             } break;
         case LLM_ARCH_HY_V4:
             {
@@ -3389,6 +3393,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
+                        if (cparams.kv_share) {
+                            LLAMA_LOG_WARN("%s: --kv-share is not supported for the sparse-attention hybrid cache; slots will not share prefixes\n", __func__);
+                        }
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
@@ -3408,7 +3415,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* kv_lazy           */ cparams.kv_lazy);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,

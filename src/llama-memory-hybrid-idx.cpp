@@ -38,14 +38,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+                     bool   kv_lazy) :
     llama_memory_hybrid(
         model,
         no_alloc,
         type_k, type_v, v_trans, kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr, kv_lazy,
+        // no --kv-share: the inherited seq_share_prefix would alias attention pages without their indexer keys,
+        // and each cache pads its streams to its own row-size quantum, so the two would stop sharing cells
+        /* kv_share */ false),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -67,7 +71,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", kv_lazy);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -248,6 +252,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     }
 
     return mb;
+}
+
+size_t llama_memory_hybrid_idx::kv_size_per_token() const {
+    return llama_memory_hybrid::kv_size_per_token() + (mem_idx ? mem_idx->kv_size_per_token() : 0);
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -535,14 +543,24 @@ bool llama_memory_hybrid_idx_context::next() {
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
-    bool res = llama_memory_hybrid_context::apply();
+    const auto * kv_idx = get_idx();
 
-    if (ctx_idx) {
-        res = res & ctx_idx->apply();
+    // --kv-lazy: commit the indexer's pages before the base mutates the attention cells, and stop at the first
+    // failure, so a VRAM OOM never leaves the indexer holding cells that the attention cache lacks
+    if (kv_idx != nullptr && !kv_idx->ensure_window()) {
+        return false;
+    }
+
+    if (!llama_memory_hybrid_context::apply()) {
+        return false;
+    }
+
+    if (ctx_idx && !ctx_idx->apply()) {
+        return false;
     }
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
-    if (res && kpool_track()) {
+    if (kpool_track()) {
         mem->kpool_layout_update();
         if (!kpool_st) {
             kpool_st = std::make_unique<kpool_state>();
@@ -551,7 +569,7 @@ bool llama_memory_hybrid_idx_context::apply() {
         i_kpool  = i_cur;
     }
 
-    return res;
+    return true;
 }
 
 bool llama_memory_hybrid_idx_context::kpool_track() const {
