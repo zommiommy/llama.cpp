@@ -1129,7 +1129,8 @@ private:
         int32_t n_gen_last = 0;
         int32_t alora_invocation_start = -1;
         size_t  last_nl_pos = 0, n_sent_text = 0;
-        std::string generated_text, stopping_word;
+        common_chat_input generated;
+        std::string stopping_word;
         llama_tokens generated_tokens;
         std::vector<completion_token_output> generated_token_probs;
         bool has_new_line = false, truncated = false;
@@ -1243,7 +1244,7 @@ private:
         s.prompt.tokens = slot.prompt.tokens.clone();
         s.stats = slot.stats; s.n_gen_last = slot.n_gen_last;
         s.alora_invocation_start = slot.alora_invocation_start; s.last_nl_pos = slot.last_nl_pos;
-        s.n_sent_text = slot.n_sent_text; s.generated_text = slot.generated_text; s.stopping_word = slot.stopping_word;
+        s.n_sent_text = slot.n_sent_text; s.generated = std::move(slot.generated); s.stopping_word = slot.stopping_word;
         s.generated_tokens = slot.generated_tokens; s.generated_token_probs = slot.generated_token_probs;
         s.has_new_line = slot.has_new_line; s.truncated = slot.truncated; s.stop = slot.stop; s.sampled = slot.sampled;
         s.lora = slot.lora;
@@ -1284,7 +1285,7 @@ private:
         slot.prompt = std::move(s.prompt);
         slot.stats = s.stats; slot.n_gen_last = s.n_gen_last;
         slot.alora_invocation_start = s.alora_invocation_start; slot.last_nl_pos = s.last_nl_pos;
-        slot.n_sent_text = s.n_sent_text; slot.generated_text = s.generated_text; slot.stopping_word = s.stopping_word;
+        slot.n_sent_text = s.n_sent_text; slot.generated = std::move(s.generated); slot.stopping_word = s.stopping_word;
         slot.generated_tokens = s.generated_tokens; slot.generated_token_probs = s.generated_token_probs;
         slot.has_new_line = s.has_new_line; slot.truncated = s.truncated; slot.stop = s.stop; slot.sampled = s.sampled;
         slot.lora = s.lora;
