@@ -164,7 +164,7 @@ keys have slid out is a silent correctness hazard. The server logs
 - **Applies to** standard attention (`llama_kv_cache`), hybrid
   (`llama_memory_hybrid`), and recurrent (`llama_memory_recurrent`) caches — i.e.
   the large, unbounded-context caches lazy growth is designed for — and to the
-  sparse-attention hybrid (`llama_memory_hybrid_idx`, qwen4exp / Qwen3.8-Flash-Next),
+  sparse-attention hybrid (`llama_memory_hybrid_idx`: qwen4exp / Qwen3.8-Flash-Next, glm5-next),
   whose attention KV, per-token indexer keys and recurrent state (PLE conv-history
   rows included) all commit on demand. `--kv-share` stays off for that cache: the
   inherited prefix aliasing would share attention pages without their indexer keys.
