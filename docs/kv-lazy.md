@@ -131,6 +131,13 @@ composable mechanisms — both **CUDA-only** and both requiring `--kv-lazy`:
   same boundary); a **pure-recurrent** model needs only `--ssm-cache`; a **pure-attention**
   model needs only `--kv-share`.
 
+A borrower decodes exactly as if it had reused the owner's prefix in the owner's own
+slot through the upstream prompt cache: greedy output is byte-identical
+(`tools/server/tests/kv-share-parity.py`, f16 alias and q8_0 copy paths). It is not
+bit-identical to a cold prefill of the borrower's own prompt, for the same reason the
+upstream prompt cache is not: a cached prefix plus a short suffix ubatch rounds
+differently from one long prefill, and greedy decoding can flip at a near-tie.
+
 ### Quantized-KV tradeoff (alias vs copy)
 
 Page-aliasing needs the shared prefix to end on a 2 MiB page boundary that is ALSO a

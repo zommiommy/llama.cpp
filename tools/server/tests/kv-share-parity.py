@@ -7,6 +7,12 @@ This script intentionally does not use pytest: it is a GPU-gated local regressio
 for the forced-borrow server scenario that exercises both the f16 alias path and
 the q8_0 copy path. Missing binary/model/GPU prints SKIP and exits 0; real
 server/parity/path failures print FAIL and exit non-zero.
+
+The reference is the owner's prefix reused in the owner's own slot through the
+upstream prompt cache: a borrowed prefix must be indistinguishable from that.
+A cold prefill of the borrower's prompt is not a valid reference, because the
+kernels are not batch-invariant: the cached prefix plus a short suffix ubatch
+rounds differently from one long prefill, and greedy decoding flips at near-ties.
 """
 
 from __future__ import annotations
@@ -76,6 +82,9 @@ class ReuseStats:
 @dataclass
 class ServerRun:
     cache_type: str
+    # True: two slots, kv-share on, the borrower forced onto the slot the owner did not use.
+    # False: one slot, kv-share off, the borrower reuses the owner's prefix in place.
+    share: bool = True
     process: subprocess.Popen[str] | None = None
     output_lines: list[str] = field(default_factory=list)
     output_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -98,7 +107,7 @@ class ServerRun:
             "-m",
             str(MODEL),
             "--kv-lazy",
-            "--kv-share",
+            *(["--kv-share", "-sps", "0", "-np", "2"] if self.share else ["-np", "1"]),
             "--no-context-shift",
             "--cache-type-k",
             self.cache_type,
@@ -108,10 +117,6 @@ class ServerRun:
             "on",
             "--cache-ram",
             "0",
-            "-sps",
-            "0",
-            "-np",
-            "2",
             "-c",
             "8192",
             "--host",
@@ -263,48 +268,46 @@ def request_json(
         raise TestFailure(f"{path} returned invalid JSON: {exc}") from exc
 
 
-def completion_content(body: Mapping[str, object], timeout_seconds: float = 180.0) -> str:
+def completion(body: Mapping[str, object], timeout_seconds: float = 180.0) -> dict[str, object]:
     status, payload = request_json("POST", "/completion", body, timeout_seconds)
     if status != 200:
         raise TestFailure(f"/completion returned HTTP {status}: {payload!r}")
     if not isinstance(payload, dict):
         raise TestFailure(f"/completion returned non-object JSON: {payload!r}")
-    content = payload.get("content")
-    if not isinstance(content, str):
+    if not isinstance(payload.get("content"), str):
         raise TestFailure(f"/completion response has no string content: {payload!r}")
-    return content
+    return payload
 
 
-def run_cold(cache_type: str) -> str:
-    print(f"[{cache_type}] cold baseline")
-    with ServerRun(cache_type) as server:
-        content = completion_content(BORROWER_BODY)
-        server.assert_alive()
+def cached_tokens(payload: Mapping[str, object]) -> int:
+    timings = payload.get("timings")
+    if not isinstance(timings, dict) or not isinstance(timings.get("cache_n"), int):
+        raise TestFailure(f"/completion response has no timings.cache_n: {payload!r}")
+    return timings["cache_n"]
+
+
+def run_owner_then_borrower(server: ServerRun) -> dict[str, object]:
+    # the owner finishes before the borrower starts, so the borrower always decodes alone
+    completion(OWNER_BODY, timeout_seconds=300.0)
+    borrower = completion(BORROWER_BODY)
+    server.assert_alive()
+    return borrower
+
+
+def run_reuse_baseline(cache_type: str) -> tuple[str, int]:
+    print(f"[{cache_type}] same-slot reuse baseline")
+    with ServerRun(cache_type, share=False) as server:
+        borrower = run_owner_then_borrower(server)
         assert_no_fatal_logs(server.output(), cache_type)
-        return content
+    return borrower["content"], cached_tokens(borrower)
 
 
 def run_borrow(cache_type: str) -> tuple[str, str]:
     print(f"[{cache_type}] forced borrow")
-    owner_errors: list[BaseException] = []
-
-    def run_owner() -> None:
-        try:
-            completion_content(OWNER_BODY, timeout_seconds=300.0)
-        except BaseException as exc:
-            owner_errors.append(exc)
-
     with ServerRun(cache_type) as server:
-        owner_thread = threading.Thread(target=run_owner, name=f"owner-{cache_type}")
-        owner_thread.start()
-        time.sleep(5.0)
-        if owner_errors and not owner_thread.is_alive():
-            raise TestFailure(f"owner request failed before borrower: {owner_errors[0]!r}")
-        content = completion_content(BORROWER_BODY)
-        server.assert_alive()
+        borrower = run_owner_then_borrower(server)
         logs = server.wait_for_reuse_log(cache_type)
-    owner_thread.join(timeout=10.0)
-    return content, logs
+    return borrower["content"], logs
 
 
 def extract_reuse_stats(logs: str, cache_type: str) -> ReuseStats:
@@ -341,13 +344,13 @@ def assert_cache_path(cache_type: str, stats: ReuseStats) -> None:
         raise TestFailure(f"unexpected cache type {cache_type!r}")
 
 
-def assert_byte_identical(cache_type: str, cold: str, borrow: str) -> None:
-    cold_bytes = cold.encode("utf-8")
+def assert_byte_identical(cache_type: str, reuse: str, borrow: str) -> None:
+    reuse_bytes = reuse.encode("utf-8")
     borrow_bytes = borrow.encode("utf-8")
-    if borrow_bytes != cold_bytes:
+    if borrow_bytes != reuse_bytes:
         raise TestFailure(
-            f"[{cache_type}] borrower output differed from cold baseline\n"
-            f"COLD  ({len(cold_bytes)} bytes): {cold!r}\n"
+            f"[{cache_type}] borrower output differed from same-slot reuse\n"
+            f"REUSE ({len(reuse_bytes)} bytes): {reuse!r}\n"
             f"BORROW({len(borrow_bytes)} bytes): {borrow!r}"
         )
 
@@ -394,11 +397,15 @@ def preflight_skip_reason() -> str | None:
 
 
 def run_case(cache_type: str) -> None:
-    cold = run_cold(cache_type)
+    reuse, reuse_cached = run_reuse_baseline(cache_type)
     borrow, logs = run_borrow(cache_type)
-    assert_byte_identical(cache_type, cold, borrow)
     stats = extract_reuse_stats(logs, cache_type)
     assert_cache_path(cache_type, stats)
+    if stats.reused != reuse_cached:
+        raise TestFailure(
+            f"[{cache_type}] kv-share reused {stats.reused} tokens but same-slot reuse cached {reuse_cached}"
+        )
+    assert_byte_identical(cache_type, reuse, borrow)
     print(f"[{cache_type}] reused={stats.reused} aliased={stats.aliased} copied={stats.copied}")
 
 
@@ -419,7 +426,7 @@ def main() -> int:
         return 130
 
     print(
-        "PASS: kv-share borrower output matched cold baseline byte-for-byte "
+        "PASS: kv-share borrower output matched same-slot prompt reuse byte-for-byte "
         "for f16 alias path and q8_0 copy path"
     )
     return 0
