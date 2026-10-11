@@ -128,6 +128,7 @@ class ServerProcess:
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
     llama_cache: str | None = None
+    kv_swap_max_active: int | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -226,6 +227,8 @@ class ServerProcess:
             server_args.extend(["--ctx-size", self.n_ctx])
         if self.n_slots:
             server_args.extend(["--parallel", self.n_slots])
+        if self.kv_swap_max_active:
+            server_args.extend(["--kv-swap-max-active", self.kv_swap_max_active])
         if self.ctk:
             server_args.extend(["-ctk", self.ctk])
         if self.ctv:
