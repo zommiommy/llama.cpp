@@ -1056,6 +1056,10 @@ private:
         stop_type stop = STOP_TYPE_NONE;
         llama_token sampled = LLAMA_TOKEN_NULL;
         std::vector<common_adapter_lora_info> lora;
+        // set by launch_slot_with_task and cleared by reset(), so they must travel with the request
+        int32_t n_predict_max = -1;
+        std::mt19937 spec_synth_rng;
+        std::vector<uint64_t> n_accepted_per_pos;
     };
     std::vector<server_suspended> suspended; // parked requests awaiting resume (priority-ordered on pop)
     int32_t kv_swap_reserve_mib = -1;         // <0 = uninit (read LLAMA_KV_SWAP_RESERVE_MIB once); 0 = disabled
@@ -1167,6 +1171,9 @@ private:
         s.generated_tokens = slot.generated_tokens; s.generated_token_probs = slot.generated_token_probs;
         s.has_new_line = slot.has_new_line; s.truncated = slot.truncated; s.stop = slot.stop; s.sampled = slot.sampled;
         s.lora = slot.lora;
+        s.n_predict_max = slot.n_predict_max;
+        s.spec_synth_rng = slot.spec_synth_rng;
+        s.n_accepted_per_pos = std::move(slot.n_accepted_per_pos);
 
         slot.mem.seq_rm(slot.id, -1, -1);
         slot.state = SLOT_STATE_IDLE;
@@ -1208,6 +1215,9 @@ private:
         slot.generated_tokens = s.generated_tokens; slot.generated_token_probs = s.generated_token_probs;
         slot.has_new_line = s.has_new_line; slot.truncated = s.truncated; slot.stop = s.stop; slot.sampled = s.sampled;
         slot.lora = s.lora;
+        slot.n_predict_max = s.n_predict_max;
+        slot.spec_synth_rng = s.spec_synth_rng;
+        slot.n_accepted_per_pos = std::move(s.n_accepted_per_pos);
         slot.i_batch = -1;
         slot.state = SLOT_STATE_GENERATING;
         slot.kv_swap_resume_n_decoded = (int32_t) slot.stats.n_gen; // start the post-resume min-residency window
@@ -1219,11 +1229,8 @@ private:
             slot.release();
             return;
         }
-        {
-            // mirror launch_slot_with_task: rebind the sampler to this (possibly different) slot id
-            const bool backend_sampling = slot.task->params.sampling.backend_sampling && !slot.can_speculate();
-            llama_set_sampler(slot.ctx_tgt, slot.id, backend_sampling ? common_sampler_get(slot.smpl.get()) : nullptr);
-        }
+        // the slot may differ from the one the request was parked from
+        bind_backend_sampler(slot, slot.task->params);
         SLT_INF(slot, "kv-swap: UNPARKED (priority=%d, %zu still suspended)\n", slot.task->params.priority, suspended.size());
     }
 
@@ -2296,6 +2303,18 @@ private:
         return output;
     }
 
+    // run the request's sampler chain inside the decode graph when it asks for backend sampling
+    // (launch_slot_with_task and kv-swap resume both bind through here, so they cannot diverge)
+    void bind_backend_sampler(const server_slot & slot, const task_params & params) {
+        // TODO: getting pre sampling logits is not yet supported with backend sampling
+        const bool need_pre_sample_logits = params.sampling.n_probs > 0 && !params.post_sampling_probs;
+
+        // TODO: tmp until backend sampling is fully implemented
+        const bool use_backend_sampling = params.sampling.backend_sampling && !need_pre_sample_logits;
+
+        llama_set_sampler(ctx_tgt, slot.id, use_backend_sampling ? common_sampler_get(slot.smpl.get()) : nullptr);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -2380,19 +2399,7 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
-
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
-
-            // TODO: getting pre sampling logits is not yet supported with backend sampling
-            use_backend_sampling &= !need_pre_sample_logits;
-
-            // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
-            } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
-            }
+            bind_backend_sampler(slot, task.params);
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
