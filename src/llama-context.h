@@ -231,8 +231,9 @@ private:
     //
 
     // Make sure enough space is available for outputs.
+    // need_logits = false skips the n_vocab-wide logits rows (an encoder graph that emits no logits).
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, bool need_logits = true);
 
     void output_reorder();
 

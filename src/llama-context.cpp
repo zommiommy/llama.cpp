@@ -1553,16 +1553,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     n_queued_tokens += n_tokens;
 
-    // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
-        return -2;
-    };
-
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        output_ids[i] = i;
-    }
-
+    // the graph is built for n_outputs outputs; output_reserve() below resets it, so it is set again there
     n_outputs = n_tokens;
 
     const auto causal_attn_org = cparams.causal_attn;
@@ -1589,6 +1580,19 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     auto * t_logits  = res->get_logits();
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
+
+    // reserve the output buffer once the graph is known: an encoder graph without logits (a decision
+    // head scores every token through the embeddings) needs no n_vocab-wide row per output
+    if (output_reserve(n_tokens, t_logits != nullptr) < n_tokens) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
+        return -2;
+    };
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        output_ids[i] = i;
+    }
+
+    n_outputs = n_tokens;
 
     // extract logits
     if (logits.data && t_logits) {
@@ -2149,7 +2153,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, bool need_logits) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2160,7 +2164,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = need_logits;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
