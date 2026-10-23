@@ -516,7 +516,7 @@ struct server_slot {
 
     bool can_split() const {
         GGML_ASSERT(task);
-        // a decision over a non-causal context reads the whole prompt in one batch
+        // a decision over a non-causal context reads the whole prompt in one batch, or each of its attention blocks in one batch
         if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
             return false;
         }
@@ -542,6 +542,13 @@ struct server_slot {
             return true;
         }
         return false;
+    }
+
+    // end of the part of the prompt that the current batch evaluates: a decision prompt in attention blocks ends its batch at its next block
+    int32_t n_prompt_end() const {
+        GGML_ASSERT(task);
+        const int32_t pos_block = task->decision.pos_block;
+        return pos_block > 0 && prompt.n_tokens() < pos_block ? pos_block : task->n_tokens();
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -4460,7 +4467,19 @@ private:
                         }
 
                         if (!slot.can_split()) {
-                            if (slot.task->n_tokens() > n_ubatch) {
+                            // a prompt in attention blocks is evaluated one block at a time
+                            const int32_t pos_block = slot.task->decision.pos_block;
+                            if (pos_block > 0 && std::max(pos_block, slot.task->n_tokens() - pos_block) > n_ubatch) {
+                                send_error(slot,
+                                           string_format("the state (%d tokens) or the question (%d tokens) is too large to process. "
+                                                         "increase the physical batch size (current batch size: %d)",
+                                                         pos_block, slot.task->n_tokens() - pos_block, n_ubatch),
+                                           ERROR_TYPE_INVALID_REQUEST);
+                                slot.release();
+                                return;
+                            }
+
+                            if (pos_block == 0 && slot.task->n_tokens() > n_ubatch) {
                                 send_error(slot,
                                            string_format(
                                                "input (%d tokens) is too large to process. increase the physical batch "
@@ -4480,6 +4499,11 @@ private:
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;
+                            }
+
+                            // the child of a shared prompt holds exactly the first block, the parent's, and starts at the second one
+                            if (pos_block > 0 && slot.prompt.n_tokens() == pos_block && (int32_t) slot.prompt.tokens.get_common_prefix(input_tokens) == pos_block) {
+                                n_past = pos_block;
                             }
                         } else {
                             if (slot.task->n_tokens() >= slot.n_ctx) {
@@ -4839,8 +4863,8 @@ private:
                     } // end of SLOT_STATE_STARTED
 
                     if (!slot.can_split()) {
-                        // cannot fit the prompt in the current batch - will try next iter
-                        if (batch.size() + slot.task->n_tokens() > n_batch) {
+                        // cannot fit the rest of the prompt, or of its attention block, in the current batch - will try next iter
+                        if (batch.size() + slot.n_prompt_end() - slot.prompt.n_tokens() > n_batch) {
                             return;
                         }
                     }
@@ -4903,9 +4927,12 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // the batch ends at the end of the prompt, or of its attention block
+                    const int32_t n_prompt_end = slot.n_prompt_end();
+
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
-                        if (!add_prompt_mixed(slot)) {
+                        if (!add_prompt_mixed(slot, n_prompt_end)) {
                             return;
                         }
                     }
@@ -4961,7 +4988,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < n_prompt_end && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -5110,14 +5137,14 @@ private:
         return !llama_get_memory(ctx_tgt) || !llama_get_causal_attn(ctx_tgt);
     }
 
-    // add the rest of the prompt to the batch, the mtmd chunks are added as embeddings next to the text tokens
+    // add the prompt up to n_end to the batch, the mtmd chunks are added as embeddings next to the text tokens
     // the caller makes sure that it fits in the batch
     // returns false on error, the slot is then released
-    bool add_prompt_mixed(server_slot & slot) {
+    bool add_prompt_mixed(server_slot & slot, int32_t n_end) {
         const auto & input_tokens = slot.task->tokens;
         const auto n_tokens_prev = batch.size();
 
-        while (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+        while (slot.prompt.n_tokens() < n_end) {
             const auto cur_token_idx = slot.prompt.n_tokens();
             const llama_token cur_tok = input_tokens[cur_token_idx];
 

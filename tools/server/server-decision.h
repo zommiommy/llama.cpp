@@ -47,6 +47,7 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_VLLM_DECISION2:
             case COMMON_DECISION_TYPE_LFM2_D1:
             case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+            case COMMON_DECISION_TYPE_BASELABS_DECISION:
                 return true;
             default:
                 return false;
@@ -68,6 +69,7 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_LFM2_D1:
             case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
             case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+            case COMMON_DECISION_TYPE_BASELABS_DECISION:
                 return true;
             default:
                 return false;
@@ -126,7 +128,7 @@ private:
     bool   strict_payload  = false; // state, instructions and descriptions must be text, an object or an array
     bool   canonical_legend = false; // non-string score descriptions are returned as canonical JSON text
 
-    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER, VLLM_D3, H2O_LIGHTNING
+    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER, VLLM_D3, H2O_LIGHTNING, BASELABS_DECISION
     std::vector<llama_token> labels;
     std::vector<std::string> label_texts; // only if the label of an option is given to the template
 
@@ -156,6 +158,15 @@ private:
     json render_h2o(const json & state, const server_decision_question & question) const;
     std::string h2o_cut_state(const std::string & text) const;
     std::string h2o_quote(const std::string & text) const;
+    // BASELABS_DECISION: the input of the template, its texts are rendered as qev/prompt.py renders them
+    json render_baselabs(const json & state, const server_decision_question & question) const;
+    // BASELABS_DECISION: the prompt is split at the end of the state block, the two blocks of the attention mask
+    void fill_task_blocks(
+            const std::string & prompt,
+            const std::vector<raw_buffer> & files,
+            mtmd_context * mctx,
+            const mtmd_helper_init_opt & init_opt,
+            server_task & task) const;
     void fill_task_laya(llama_tokens & tokens, const server_decision_question & question, server_task & task) const;
     void fill_task_d1omni(
             const json & state,

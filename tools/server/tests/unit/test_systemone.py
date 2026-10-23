@@ -1,3 +1,4 @@
+import os
 import pytest
 from utils import *
 from test_vision_api import get_img_url
@@ -278,3 +279,57 @@ def test_systemone_images_not_supported():
         "images": [get_img_url("IMG_BASE64_URI_0")],
     })
     assert res.status_code == 501
+
+
+# there is no tiny test model of the baselabs-decision type, set BASELABS_ELEPHANT_LOCAL_MODEL to a GGUF of baselabs/elephant-1
+ELEPHANT_MODEL = os.environ.get("BASELABS_ELEPHANT_LOCAL_MODEL")
+
+BLOCKS_STATE = {"email": "Hi, the login page shows error 500 since this morning. Our whole team is blocked. -- Ana, CTO"}
+BLOCKS_QUESTIONS = {
+    "severity": {"type": "score", "instructions": "How severe is the issue?", "criteria": ["minor", "moderate", "major", "critical"]},
+    "affected": {"type": "score", "instructions": "How many people are affected?", "criteria": ["one", "a few", "a team", "everyone"]},
+}
+# probabilities of OneJev qev with the block mask (bfloat16), the runtime of the model repo
+# a causal mask gives [0.011, 0.069, 0.255, 0.664] and [0.002, 0.009, 0.928, 0.061], a bidirectional one [0.002, 0.009, 0.093, 0.896] and [0.002, 0.005, 0.864, 0.129]
+BLOCKS_REFERENCE = {
+    "severity": [0.0065, 0.0349, 0.2044, 0.7542],
+    "affected": [0.0027, 0.0084, 0.7446, 0.2444],
+}
+
+
+def elephant_server(n_slots: int, n_batch: int = 1024) -> ServerProcess:
+    server = ServerProcess()
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.model_file = ELEPHANT_MODEL
+    server.n_slots = n_slots
+    server.n_ctx = 2048 * n_slots
+    server.n_batch = n_batch
+    server.n_ubatch = n_batch
+    return server
+
+
+@pytest.mark.skipif(ELEPHANT_MODEL is None, reason="BASELABS_ELEPHANT_LOCAL_MODEL is not set")
+@pytest.mark.parametrize("n_slots", [1, 2])
+def test_systemone_attention_blocks(n_slots: int):
+    # with 2 slots the questions share the evaluation of the state block, with 1 slot each question evaluates it
+    global server
+    server = elephant_server(n_slots)
+    server.start()
+    res = server.make_request("POST", "/v1/systemone", data={"state": BLOCKS_STATE, "questions": BLOCKS_QUESTIONS})
+    assert res.status_code == 200
+    for qid, ref in BLOCKS_REFERENCE.items():
+        probs = res.body["answers"][qid]["probabilities"]
+        got = [probs[str(i)] for i in range(len(ref))]
+        assert max(abs(a - b) for a, b in zip(got, ref)) < 0.05, f"{qid}: {got} instead of {ref}"
+
+
+@pytest.mark.skipif(ELEPHANT_MODEL is None, reason="BASELABS_ELEPHANT_LOCAL_MODEL is not set")
+def test_systemone_attention_block_too_large():
+    # each block is evaluated in one ubatch, the prompt is not split inside a block
+    global server
+    server = elephant_server(1, n_batch=128)
+    server.start()
+    res = server.make_request("POST", "/v1/systemone", data={"state": "word " * 200, "questions": BLOCKS_QUESTIONS})
+    assert res.status_code == 400
+    assert "too large" in res.body["error"]["message"]

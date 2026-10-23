@@ -1826,7 +1826,7 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 *Options:*
 
-`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text. For lfm2-d1 and lfm2-d1-omni, it can be `null`, for example to ask about images only.
+`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text. For lfm2-d1, lfm2-d1-omni and baselabs-decision, it can be `null`, for example to ask about images only.
 
 `files`: Optional. An array of input files, the maximum number may be limited depending on the model. Each one is a data URL (`data:image/...;base64,...`). For audio-capable models, it can be audio clips (`data:audio/...;base64,...`). See the image input section below.
 
@@ -1843,20 +1843,22 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for granite-switch, laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1, lfm2-d1-omni and h2o-lightning. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for granite-switch, laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning and baselabs-decision. For laya, long questions and options are truncated to the token budget the model was trained with.
 
 For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. An h2o-lightning state longer than 32000 tokens keeps its first and last 16000 tokens. A server that runs clef only serves this endpoint, text generation is not available. A decision model that is also a text model, such as granite-switch, serves both and reports `["text", "decisions"]`.
 
+For baselabs-decision (Base Labs elephant-1 and mammoth-1), the full attention layers read the prompt in two blocks: the state, then the question with its options. Each block sees itself bidirectionally and the question also sees the state, so each block is evaluated in one batch and must fit in `--ubatch-size`. The questions of a request share the evaluation of the state, give the server one slot per question (`--parallel`) to use it.
+
 *Image input:*
 
-Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning) and its multimodal projector, see `--mmproj`.
+Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning, baselabs-decision) and its multimodal projector, see `--mmproj`.
 
 Images can be given in two ways, and both can be used in the same request:
 
 - The `files` field, or its alias `images`.
 - A `state` made of chat messages, either an array of messages or an object with a `messages` array. An `image_url` part in the `content` of a message is taken as an image, in the same format as chat completions. Only data URLs are accepted. For lfm2-d1-omni, an `input_audio` part is taken as an audio clip, as base64 data.
 
-All the images are placed before the state in the prompt, the ones from `files` and `images` first. The image parts are removed from the state.
+All the images are placed before the state in the prompt, the ones from `files` and `images` first. The image parts are removed from the state. For baselabs-decision, the state can instead place them: it references each image once, in order, as `<image:1>`, `<image:2>`, ...
 
 *Response:*
 
@@ -1879,6 +1881,8 @@ All the images are placed before the state in the prompt, the ones from `files` 
 The probabilities are scaled with the temperatures stored in the model file. They are not guaranteed to be calibrated for your data.
 
 For h2o-lightning, `score` questions can have 1 to 255 levels, and the `instructions` and `type` of a question can be left out (`choice` by default; `"instructions": null` is written as `null`).
+
+For baselabs-decision, the `instructions` of a question can be left out, the model then has a default question for each type.
 
 *Examples:*
 
