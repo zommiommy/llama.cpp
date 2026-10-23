@@ -237,6 +237,11 @@ struct server_task {
         // the scores are the first n_scores rows of the embeddings
         std::vector<int32_t> order;
         int32_t              n_scores = 0;
+
+        // if > 0, the prompt is two attention blocks, [0, pos_block) and [pos_block, n_tokens)
+        // the full attention of a non-causal model is bidirectional within a block and the first block never sees the second,
+        // so each block is evaluated in one batch, the second one after the first
+        int32_t pos_block = 0;
     };
     decision decision;
 

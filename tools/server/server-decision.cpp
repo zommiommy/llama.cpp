@@ -32,6 +32,22 @@ static std::string decision_meta_str(const llama_model * model, const std::strin
     return n < 0 ? "" : std::string(buf);
 }
 
+// the labels of "<arch>.decision.labels": the answer is read at the token of each one
+static void decision_load_labels(const llama_model * model, const llama_vocab * vocab, std::vector<llama_token> & labels, std::vector<std::string> & texts) {
+    for (uint32_t i = 0; llama_model_decision_label(model, i) != nullptr; i++) {
+        const std::string text = llama_model_decision_label(model, i);
+        const auto toks = common_tokenize(vocab, text, false, false);
+        if (toks.size() != 1 || std::find(labels.begin(), labels.end(), toks[0]) != labels.end()) {
+            throw std::runtime_error(string_format("decision label \"%s\" is not a single distinct token", text.c_str()));
+        }
+        labels.push_back(toks[0]);
+        texts.push_back(text);
+    }
+    if (labels.empty()) {
+        throw std::runtime_error("decision model has no labels");
+    }
+}
+
 //
 // model-specific setup
 //
@@ -177,18 +193,7 @@ void server_decision_context::init(const llama_model * model) {
         n_options_max = 255;
     } else if (model_type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
         // the answer is read at the token of a label, its text is given to the template
-        for (uint32_t i = 0; llama_model_decision_label(model, i) != nullptr; i++) {
-            const std::string text = llama_model_decision_label(model, i);
-            const auto toks = common_tokenize(vocab, text, false, false);
-            if (toks.size() != 1 || std::find(labels.begin(), labels.end(), toks[0]) != labels.end()) {
-                throw std::runtime_error(string_format("decision label \"%s\" is not a single distinct token", text.c_str()));
-            }
-            labels.push_back(toks[0]);
-            label_texts.push_back(text);
-        }
-        if (labels.empty()) {
-            throw std::runtime_error("decision model has no labels");
-        }
+        decision_load_labels(model, vocab, labels, label_texts);
         // the texts of the control and user-defined tokens are quoted in the input, so that they stay text
         init_quoted_spellings(LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED, 1);
         n_options_max   = labels.size();
@@ -202,6 +207,12 @@ void server_decision_context::init(const llama_model * model) {
         }
         n_options_max = n_classes;
         choice_sorted = true;
+    } else if (model_type == COMMON_DECISION_TYPE_BASELABS_DECISION) {
+        // the answer is read at the token of a label, its text is given to the template
+        decision_load_labels(model, vocab, labels, label_texts);
+        // qev has 256 labels, a choice question has up to 255 options (qev/schema.py)
+        n_options_max   = std::min<size_t>(labels.size(), 255);
+        noul_true_first = true;
     } else {
         throw std::runtime_error("unsupported decision model type: " + type_name);
     }
@@ -243,8 +254,9 @@ static bool decision_is_payload(const json & val) {
 }
 
 std::vector<server_decision_question> server_decision_context::parse_questions(const json & body) const {
-    // lfm2-d1, lfm2-d1-omni, lfm3-d1 and vllm-d3 accept a null state, for example to ask about images only
-    const bool null_state = type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
+    // lfm2-d1, lfm2-d1-omni, lfm3-d1, vllm-d3 and baselabs-decision accept a null state, for example to ask about images only
+    const bool null_state = type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI ||
+                            type == COMMON_DECISION_TYPE_BASELABS_DECISION;
     if (!body.contains("state") || (body.at("state").is_null() && !null_state)) {
         throw std::invalid_argument("\"state\" must be provided");
     }
@@ -268,11 +280,12 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         }
         // the vllm-d3 prompt has a default question
         // h2o-lightning: the instructions can be left out, the template has a default, and the type defaults to choice
+        // baselabs-decision: the instructions can be left out, the template has a default for each question type
         const bool is_h2o = type == COMMON_DECISION_TYPE_H2O_LIGHTNING;
         const json instructions = q.contains("instructions") ? q.at("instructions") : (is_h2o ? json(std::string()) : json());
         // minicpm-ocr-jev answers one fixed question, the prompt is entirely in the template
         const bool is_ocr_jev = type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV;
-        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o && !is_ocr_jev) {
+        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o && !is_ocr_jev && type != COMMON_DECISION_TYPE_BASELABS_DECISION) {
             throw err("\"instructions\" must be provided");
         }
         if (strict_payload && (!decision_is_payload(instructions) || instructions == "")) {
@@ -937,6 +950,103 @@ json server_decision_context::render_h2o(const json & state, const server_decisi
     return inp;
 }
 
+//
+// baselabs-decision: the texts are rendered the way qev/prompt.py of OneJev renders them with Python (json.dumps, str.strip)
+//
+
+// given to the baselabs-decision template: text at the end of the state block, where the second attention block starts
+static const std::string BASELABS_MARKER = "<<baselabs:";
+static const std::string BASELABS_SEP    = "<<baselabs:sep>>";
+
+// render_entry(): an instructions or description entry as text
+static std::string decision_qev_entry(const json & entry) {
+    if (entry.is_null()) {
+        return "";
+    }
+    if (entry.is_string()) {
+        return decision_py_rstrip(decision_py_lstrip(entry.get<std::string>()));
+    }
+    return decision_py_dumps(entry, 2, ",", ": ", false);
+}
+
+// qev/media.py: the state references each image once, in order, as <image:N>, and the image takes its place
+// returns false if the text has no reference, the template then puts the images before the state
+static bool decision_qev_place_images(std::string & text, size_t n_images) {
+    static const std::string open = "<image:";
+    std::string out;
+    size_t n_seen = 0;
+    size_t n_done = 0; // the chars of text that are in out
+    for (size_t i = text.find(open); i != std::string::npos; i = text.find(open, i + 1)) {
+        size_t j = i + open.size();
+        while (j < text.size() && text[j] >= '0' && text[j] <= '9') {
+            j++;
+        }
+        if (j == i + open.size() || j == text.size() || text[j] != '>') {
+            continue;
+        }
+        if (std::strtoull(text.c_str() + i + open.size(), nullptr, 10) != ++n_seen || n_seen > n_images) {
+            throw std::invalid_argument("the state must reference the images once each, in order, as <image:1>, <image:2>, ...");
+        }
+        out.append(text, n_done, i - n_done);
+        out += get_media_marker();
+        n_done = j + 1;
+        i = j;
+    }
+    if (n_seen == 0) {
+        return false;
+    }
+    if (n_seen != n_images) {
+        throw std::invalid_argument("the state must reference the images once each, in order, as <image:1>, <image:2>, ...");
+    }
+    out.append(text, n_done, std::string::npos);
+    text = std::move(out);
+    return true;
+}
+
+json server_decision_context::render_baselabs(const json & state, const server_decision_question & question) const {
+    json options = json::array();
+    for (size_t i = 0; i < question.options.size(); i++) {
+        const auto & opt = question.options[i];
+        json option = json::object();
+        option["label"] = label_texts[i];
+        option["key"]   = opt.key;
+        // none if not given: a noul option then has the default description of the template
+        option["description"] = opt.description.is_null() ? json() : json(decision_qev_entry(opt.description));
+        options.push_back(option);
+    }
+
+    json inp = json::object();
+    inp["type"]         = decision_question_type_name(question.type);
+    // render_state(): text as is, any other value as JSON
+    inp["state"]        = state.is_null() ? std::string() : state.is_string() ? state.get<std::string>() : decision_py_dumps(state, 2, ",", ": ", false);
+    inp["instructions"] = decision_qev_entry(question.instructions);
+    inp["options"]      = options;
+    inp = decision_replace_text(inp, BASELABS_MARKER, "<<baselabs ");
+    inp["sep"] = BASELABS_SEP;
+    return inp;
+}
+
+void server_decision_context::fill_task_blocks(
+        const std::string & prompt,
+        const std::vector<raw_buffer> & files,
+        mtmd_context * mctx,
+        const mtmd_helper_init_opt & init_opt,
+        server_task & task) const {
+    const size_t pos = prompt.find(BASELABS_SEP);
+    if (pos == std::string::npos || prompt.find(BASELABS_SEP, pos + 1) != std::string::npos) {
+        throw std::runtime_error("unexpected layout of the decision prompt");
+    }
+    // the state block ends with a newline and the question block starts with a word, so the two texts tokenize as the whole prompt does
+    const std::string head = prompt.substr(0, pos);
+    const std::string tail = prompt.substr(pos + BASELABS_SEP.size());
+
+    task.tokens = files.empty() ? server_tokens(common_tokenize(vocab, head, false, true), false) : process_mtmd_prompt(mctx, head, files, init_opt);
+    task.decision.pos_block = task.tokens.size();
+    for (const llama_token token : common_tokenize(vocab, tail, false, true)) {
+        task.tokens.push_back(token);
+    }
+}
+
 // given to the lfm2-d1-omni template: text between the pieces of the prompt, and at the start of the pieces that are cut to a token budget
 static const std::string D1OMNI_MARKER        = "<<d1omni:";
 static const std::string D1OMNI_SEP           = "<<d1omni:sep>>";
@@ -1106,8 +1216,9 @@ std::string server_decision_context::render(
         size_t n_images,
         bool is_audio) const {
     // the template is given raw JSON values, it serializes the ones that are not strings
-    // h2o-lightning: the template is given texts
-    json inp = type == COMMON_DECISION_TYPE_H2O_LIGHTNING ? render_h2o(state, question) : json{
+    // h2o-lightning, baselabs-decision: the template is given texts
+    json inp = type == COMMON_DECISION_TYPE_H2O_LIGHTNING ? render_h2o(state, question) :
+               type == COMMON_DECISION_TYPE_BASELABS_DECISION ? render_baselabs(state, question) : json{
         {"id",           question.id},
         {"type",         decision_question_type_name(question.type)},
         {"instructions", question.instructions},
@@ -1180,6 +1291,15 @@ std::string server_decision_context::render(
         inp["instructions"] = get_media_marker();
     }
 
+    // baselabs-decision: the images that the state references as <image:N> are placed there instead
+    if (type == COMMON_DECISION_TYPE_BASELABS_DECISION && n_images > 0) {
+        std::string text = inp.at("state").get<std::string>();
+        if (decision_qev_place_images(text, n_images)) {
+            inp["state"]  = text;
+            inp["images"] = json::array();
+        }
+    }
+
     jinja::context ctx(tmpl->source());
     jinja::global_from_json(ctx, inp, false);
     jinja::runtime runtime(ctx);
@@ -1221,9 +1341,13 @@ void server_decision_context::fill_task(
     }
 
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_GRANITE_SWITCH || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 ||
-        type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
+        type == COMMON_DECISION_TYPE_H2O_LIGHTNING || type == COMMON_DECISION_TYPE_BASELABS_DECISION) {
         // lev reads the ratings of a noul question at its first labels, not at the digits
         task.decision.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
+    }
+    if (type == COMMON_DECISION_TYPE_BASELABS_DECISION) {
+        fill_task_blocks(prompt, files, mctx, init_opt, task);
+        return;
     }
     if (type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI) {
         std::vector<std::string>  texts;
@@ -1763,6 +1887,16 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
         for (size_t j = i + 1; j < end; j++) {
             n_shared = std::min(n_shared, parent.tokens.get_common_prefix(tasks[j].tokens));
             n_shared = std::min(n_shared, tasks[j].tokens.size() - 1);
+        }
+
+        // a prompt in attention blocks shares exactly its first block: a longer common prefix ends inside the second block,
+        // whose tokens see the rest of their block
+        if (parent.decision.pos_block > 0) {
+            bool is_block = n_shared >= (size_t) parent.decision.pos_block;
+            for (size_t j = i + 1; j < end; j++) {
+                is_block = is_block && tasks[j].decision.pos_block == parent.decision.pos_block;
+            }
+            n_shared = is_block ? parent.decision.pos_block : 0;
         }
 
         if (end - i < 2 || n_shared == 0) {

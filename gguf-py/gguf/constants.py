@@ -6642,6 +6642,7 @@ class DecisionType:
     GRANITE_SWITCH = "granite-switch"  # same as openjev, run by the decision aLoRA of granite switch
     H2O_LIGHTNING = "h2o-lightning"  # same as openjev, labels read after an answer prefill
     MINICPM_OCR_JEV = "openbmb-minicpm-ocr-jev"  # class scores of a value head read at the last token, one fixed task
+    BASELABS_DECISION = "baselabs-decision"  # same as openjev, the full attention is bidirectional within the state block and within the question block
 
 
 class VisionProjectorType:
