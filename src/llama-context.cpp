@@ -608,8 +608,9 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.no_alloc() && !opt_ctx) {
+    // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation,
+    // and elastic compute buffers follow the graphs instead of the worst case
+    if (!model.no_alloc() && !opt_ctx && !compute_elastic()) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -748,6 +749,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    if (compute_elastic()) {
+        ggml_backend_sched_set_resize_callback(sched.get(), sched_compute_resize, this);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -2776,6 +2780,33 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
+}
+
+bool llama_context::compute_elastic() const {
+    return moe_cache && cparams.moe_cache_free > 0;
+}
+
+bool llama_context::sched_compute_resize(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data) {
+    // pinned host memory is slow to allocate and leaves the device memory alone
+    if (ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+
+    auto * lctx = static_cast<llama_context *>(user_data);
+
+    // a smaller difference is not worth a reallocation: the cache grows only into more than two of its steps of free memory
+    constexpr size_t shrink_min = 256*1024*1024;
+
+    const bool shrink = size_new < size_cur && size_cur - size_new >= shrink_min;
+    if (size_new > size_cur) {
+        lctx->moe_cache->make_room(ggml_backend_buft_get_device(buft), size_new - size_cur);
+    }
+    if (size_new > size_cur || shrink) {
+        LLAMA_LOG_DEBUG("%s: %s compute buffer %.2f -> %.2f MiB\n", __func__, ggml_backend_buft_name(buft),
+                size_cur/1024.0/1024.0, size_new/1024.0/1024.0);
+    }
+
+    return shrink;
 }
 
 ggml_status llama_context::graph_compute(

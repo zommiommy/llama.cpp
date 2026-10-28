@@ -493,6 +493,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    ggml_gallocr_resize_callback resize_callback;
+    void * resize_callback_user_data;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -577,6 +580,11 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
+}
+
+void ggml_gallocr_set_resize_callback(ggml_gallocr_t galloc, ggml_gallocr_resize_callback callback, void * user_data) {
+    galloc->resize_callback = callback;
+    galloc->resize_callback_user_data = user_data;
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
@@ -904,9 +912,11 @@ static bool ggml_gallocr_reserve_n_impl(
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
+        bool shared = false;
         for (int j = 0; j < i; j++) {
             if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
                 galloc->buffers[i] = galloc->buffers[j];
+                shared = true;
                 break;
             }
         }
@@ -920,6 +930,14 @@ static bool ggml_gallocr_reserve_n_impl(
             new_size += new_chunk_size;
             if (new_chunk_size > cur_chunk_size) {
                 realloc = true;
+            }
+        }
+        if (galloc->resize_callback != NULL && !no_alloc && !shared) {
+            const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+            if (realloc || new_size < cur_size) {
+                // the callback makes room for a buffer that grows and decides if one that would be too large shrinks
+                const bool shrink = galloc->resize_callback(galloc->bufts[i], cur_size, new_size, galloc->resize_callback_user_data);
+                realloc = realloc || shrink;
             }
         }
         if (realloc) {

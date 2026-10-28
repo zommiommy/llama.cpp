@@ -2490,6 +2490,11 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     sched->callback_realloc_user_data = user_data;
 }
 
+void ggml_backend_sched_set_resize_callback(ggml_backend_sched_t sched, ggml_gallocr_resize_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_set_resize_callback(sched->galloc, callback, user_data);
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
