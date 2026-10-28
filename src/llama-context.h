@@ -282,6 +282,13 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // ggml_backend_sched resize callback of an elastic MoE cache: prompt and generation graphs never run at the same time, so
+    // the device compute buffers follow each reservation down, and the cache makes room for them before they grow
+    static bool sched_compute_resize(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data);
+
+    // the device compute buffers are sized to each reservation, see sched_compute_resize
+    bool compute_elastic() const;
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);

@@ -692,25 +692,47 @@ struct llama_moe_cache::impl {
             if (!d.elastic || d.host_bytes == 0) {
                 continue;
             }
-            size_t free;
-            size_t total;
-            ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
             // shrink below the target and grow above it by a step, so a growing KV cache releases memory every few ubatches
-            const int64_t surplus = (int64_t) free - (int64_t) free_target;
+            const int64_t surplus = free_surplus(id);
             int64_t delta = 0;
             if (surplus < 0) {
                 delta = surplus - (int64_t) resize_step;
             } else if (grow && surplus > 2*(int64_t) resize_step) {
                 delta = surplus - (int64_t) resize_step;
             }
-            if (delta == 0) {
+            if (delta != 0) {
+                resize_device(id, delta);
+            }
+        }
+    }
+
+    // shrink the elastic groups of dev so that size more bytes than the target are free
+    void make_room(ggml_backend_dev_t dev, size_t size) {
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
+            if (!d.elastic || d.host_bytes == 0 || ggml_backend_get_device(d.backend) != dev) {
                 continue;
             }
-            // the groups of a device share the change by the size of their experts, as they share the budget
-            for (group & g : groups) {
-                if (g.id == (int32_t) id && g.n_slots > 0) {
-                    resize(g, (int64_t) ((double) delta*g.host_bytes/d.host_bytes));
-                }
+            const int64_t surplus = free_surplus(id) - (int64_t) size;
+            if (surplus < 0) {
+                resize_device(id, surplus);
+            }
+        }
+    }
+
+    // free memory of device id beyond the target
+    int64_t free_surplus(size_t id) const {
+        size_t free;
+        size_t total;
+        ggml_backend_dev_memory(ggml_backend_get_device(devices[id].backend), &free, &total);
+        return (int64_t) free - (int64_t) free_target;
+    }
+
+    // the groups of a device share a change of its cache by the size of their experts, as they share the budget
+    void resize_device(size_t id, int64_t delta) {
+        for (group & g : groups) {
+            if (g.id == (int32_t) id && g.n_slots > 0) {
+                resize(g, (int64_t) ((double) delta*g.host_bytes/devices[id].host_bytes));
             }
         }
     }
@@ -898,6 +920,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
 
 void llama_moe_cache::adapt(bool grow) {
     pimpl->adapt(grow);
+}
+
+void llama_moe_cache::make_room(ggml_backend_dev_t dev, size_t size) {
+    pimpl->make_room(dev, size);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
