@@ -2889,6 +2889,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_FREE_MIB"));
     add_opt(common_arg(
+        {"--moe-cpu-experts"}, "N",
+        "the CPU computes up to N experts of each MoE layer that miss the MoE cache in a small batch, while the GPU computes the "
+        "cached ones and copies the other missing ones (default: 0, the GPU copies every missing expert)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cpu_experts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CPU_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-tail-skip"}, "R",
+        "skip an expert that misses the MoE cache when no token of a small batch selects it at a rank below R (rank 0 has the largest "
+        "weight): its output is zero and the other weights stay as they are. faster with a small cache, changes the output "
+        "(default: 0, off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_tail_skip = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TAIL_SKIP"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

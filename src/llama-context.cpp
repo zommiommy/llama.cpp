@@ -380,6 +380,8 @@ llama_context::llama_context(
     cparams.kv_share       = params.kv_share;
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.moe_cache_free = params.moe_cache_free;
+    cparams.moe_cpu_experts = params.moe_cpu_experts;
+    cparams.moe_tail_skip   = params.moe_tail_skip;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -580,7 +582,8 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_free);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_free,
+                cparams.moe_cpu_experts, cparams.moe_tail_skip);
         }
 
         sched_reserve();
@@ -1873,7 +1876,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // an elastic MoE cache gives back the memory the KV cache grew into, and grows into memory freed since,
     // but not during warmup, as the server may still load a draft model after it
     if (moe_cache) {
-        moe_cache->adapt(!cparams.warmup);
+        moe_cache->adapt(!cparams.warmup, (int64_t) batch_inp.tokens.size());
     }
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
@@ -2854,6 +2857,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const ggml_tensor * ids = node->src[2];
     if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    // prompt batches use about every expert: the MoE cache streams all of them, overlapped with the compute of the previous layer
+    if (lctx->moe_cache && lctx->moe_cache->ring_bind(backend, src, dst, ids->ne[1])) {
         return true;
     }
 
@@ -4077,6 +4085,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_free              =*/ 0,
+        /*.moe_cpu_experts             =*/ 0,
+        /*.moe_tail_skip               =*/ 0,
         /*.cache_layers                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
