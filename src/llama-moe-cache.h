@@ -36,6 +36,9 @@ public:
     // elastic cache: give back the memory other buffers grew into, and with grow take free memory beyond the target
     void adapt(bool grow);
 
+    // elastic cache: shrink so that size more bytes than the target are free on dev, for a buffer about to grow by size
+    void make_room(ggml_backend_dev_t dev, size_t size);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:
