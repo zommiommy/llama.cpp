@@ -345,6 +345,7 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    bool moe_cache_grow = false; // the elastic MoE cache grows from the second decode on, see decode()
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

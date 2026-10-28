@@ -379,6 +379,7 @@ llama_context::llama_context(
     cparams.kv_lazy        = params.kv_lazy;
     cparams.kv_share       = params.kv_share;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_free = params.moe_cache_free;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -618,7 +619,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_free);
         }
 
         sched_reserve();
@@ -2157,6 +2158,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    // an elastic MoE cache gives back the memory the KV cache grew into, and grows into memory freed since,
+    // but not in the first decode of the context: that is common_init's warmup, after which the server may still load a
+    // draft model
+    if (moe_cache) {
+        moe_cache->adapt(moe_cache_grow);
+        moe_cache_grow = true;
     }
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
@@ -4453,6 +4462,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_free              =*/ 0,
         /*.cache_layers                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

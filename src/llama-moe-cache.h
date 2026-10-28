@@ -13,7 +13,8 @@ struct llama_model;
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    // with free > 0 the cache is elastic: it holds memory only for its active slots, at most size, and adapt() keeps free bytes of each device free
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, size_t free);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -31,6 +32,9 @@ public:
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+
+    // elastic cache: give back the memory other buffers grew into, and with grow take free memory beyond the target
+    void adapt(bool grow);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
