@@ -423,16 +423,30 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
-                sq.pos_min == sp.begin()->first) {
+        const bool same_start = !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first;
+
+        // an edit from a position above the first one, such as dropping the rejected drafts of a verify step,
+        // leaves the cells and pools below it alone: cut the layout there instead of rebuilding it from the
+        // ordered set, which walks every cell of the sequence
+        if (mem_idx_stale[s] != POS_CLEAN && same_start && mem_idx_stale[s] > sq.pos_min) {
+            const auto cut = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(mem_idx_stale[s], 0u));
+            sq.cells.erase(cut, sq.cells.end());
+            while (!sq.pools.empty() && sq.pools.back() + kpool > sq.cells.size()) {
+                sq.pools.pop_back();
+            }
+            sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+        }
+
+        if (same_start && !sq.cells.empty() && (mem_idx_stale[s] == POS_CLEAN || mem_idx_stale[s] > sq.pos_min)) {
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // the appended tail accounts for every cell only if nothing before it was dropped; an edit at or below
+        // the first position regroups the whole sequence
+        if (sq.cells.size() != sp.size() || !same_start ||
+                (mem_idx_stale[s] != POS_CLEAN && mem_idx_stale[s] <= sq.pos_min)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
