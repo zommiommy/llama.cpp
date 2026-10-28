@@ -1096,6 +1096,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "MOE_CACHE_FILL",
+    "MOE_CACHE_JOIN",
 
     "UNARY",
 
@@ -1113,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1212,6 +1214,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "moe_cache_fill(ids, slot_map, state, log, banks, x)",
+    "moe_cache_join(experts, state)",
 
     "unary(x)",
 
@@ -1229,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6670,6 +6674,87 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cache_fill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * slot_map,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * log,
+        struct ggml_tensor ** banks,
+        const void         ** host,
+        int                   n_banks,
+        int                   il,
+        const struct ggml_moe_cache_xchg * xchg,
+        int                   skip_rank) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(slot_map->type == GGML_TYPE_I32 && ggml_is_contiguous(slot_map));
+    GGML_ASSERT(state->type == GGML_TYPE_I32 && ggml_is_contiguous(state));
+    GGML_ASSERT(log->type == GGML_TYPE_I32 && ggml_is_contiguous(log) && ggml_nelements(log) >= 4);
+    GGML_ASSERT(n_banks >= 1 && n_banks <= 3);
+    GGML_ASSERT(il >= 0 && il < slot_map->ne[1]);
+    GGML_ASSERT(skip_rank >= 0 && skip_rank <= ids->ne[0]);
+
+    const int64_t n_slots = banks[0]->ne[2] - 1;
+    GGML_ASSERT(ggml_nelements(state) >= GGML_MOE_CACHE_STATE_SIZE(n_slots, ggml_nelements(ids)));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+
+    // il, n_banks, the host experts, xchg base, max pairs and cpu_max, skip_rank, and the offset of the skipped pairs in state
+    int32_t params[14] = { il, n_banks };
+    params[12] = skip_rank;
+    params[13] = (int32_t) (8 + 2*n_slots + 2*ggml_nelements(ids));
+    for (int i = 0; i < n_banks; ++i) {
+        GGML_ASSERT(banks[i]->ne[2] == n_slots + 1 && ggml_is_contiguous(banks[i]));
+        const uint64_t p = (uint64_t) (uintptr_t) host[i];
+        memcpy(&params[2 + 2*i], &p, sizeof(p));
+    }
+    if (xchg != NULL && xchg->cpu_max > 0) {
+        GGML_ASSERT(x != NULL && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[1] == ids->ne[1]);
+        GGML_ASSERT(xchg->max_pairs >= ggml_nelements(ids));
+        const uint64_t p = (uint64_t) (uintptr_t) xchg->base;
+        memcpy(&params[8], &p, sizeof(p));
+        params[10] = xchg->max_pairs;
+        params[11] = xchg->cpu_max;
+    }
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_FILL;
+    result->src[0] = ids;
+    result->src[1] = slot_map;
+    result->src[2] = state;
+    result->src[3] = log;
+    for (int i = 0; i < n_banks; ++i) {
+        result->src[4 + i] = banks[i];
+    }
+    result->src[7] = params[11] > 0 ? x : NULL;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cache_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * lookup) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && ggml_is_contiguous(experts) && experts->ne[3] == 1);
+    GGML_ASSERT(lookup->op == GGML_OP_MOE_CACHE_FILL);
+    GGML_ASSERT(experts->ne[1]*experts->ne[2] == ggml_nelements(lookup));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, experts);
+
+    // il, xchg base, max pairs, cpu_max, and the offset of the skipped pairs in the state, as the lookup has them
+    const int32_t * lp = (const int32_t *) lookup->op_params;
+    const int32_t params[6] = { lp[0], lp[8], lp[9], lp[10], lp[11], lp[13] };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_JOIN;
+    result->src[0] = experts;
+    result->src[1] = lookup;
+    result->src[2] = lookup->src[2];
 
     return result;
 }

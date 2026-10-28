@@ -2109,6 +2109,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_MOE_CACHE_FILL:
+        case GGML_OP_MOE_CACHE_JOIN:
+            {
+                GGML_ABORT("the MoE cache lookup works on device banks, it has no CPU implementation");
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2295,6 +2300,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TOP_K_MASK:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_MOE_CACHE_FILL:
+        case GGML_OP_MOE_CACHE_JOIN:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
