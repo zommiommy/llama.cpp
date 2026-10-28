@@ -399,6 +399,9 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         size_t moe_cache_free; // > 0: the MoE cache is elastic, it keeps this many bytes of device memory free and moe_cache_size is its maximum [EXPERIMENTAL]
+        int32_t moe_cpu_experts; // > 0: the host computes up to this many experts of a MoE layer that miss the cache, in small batches [EXPERIMENTAL]
+        int32_t moe_tail_skip;   // > 0: an expert that misses the MoE cache and that no token of a small batch selects at a rank below this
+                                 //      is skipped, its output is zero (changes the output) [EXPERIMENTAL]
         // per-layer KV cache overrides: comma-separated "IL=TYPEK[/TYPEV][:wN][:rot|:norot]" entries
         // (e.g. "3=q8_0/q4_0,7=f16:w4096,*=q4_0"). "*" replaces the type_k/type_v default
         // for every attention layer; explicit IL entries win over "*". ":wN" restricts that

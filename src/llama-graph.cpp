@@ -2331,8 +2331,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    // the experts of host-resident layers may be read from the MoE cache; the host can compute missing plain SwiGLU experts
+    const bool moe_cpu = type_op == LLM_FFN_SILU && gate_exps != nullptr && up_exps != nullptr && gate_up_exps == nullptr && !weight_before_ffn;
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, cur, moe_cpu, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2500,6 +2501,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (amax_src1.scale_s) {
             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
         }
+
+        // the outputs of the missing experts the host computed from the input as it is, without the rescale, and zero for the
+        // skipped ones
+        if (slots != nullptr) {
+            experts = moe_cache->build_join(ctx0, experts, slots);
+        }
     }
 
     if (down_exps_s) {
@@ -2565,6 +2572,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
+         ggml_tensor * cur,
+                bool   cpu,
                  int   il) const {
     if (moe_cache == nullptr) {
         return nullptr;
@@ -2584,6 +2593,16 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     if (!ggml_is_contiguous(ids)) {
         ids = ggml_cont(ctx0, ids);
     }
+
+    // the device looks up and fills its cache itself when it reads the host experts: the layer needs no host round trip
+    ggml_tensor * filled = moe_cache->build_fill(ctx0, ids, cur, il, cpu);
+    if (filled != nullptr && ggml_backend_supports_op(moe_cache->backend(il), filled)) {
+        ggml_backend_sched_set_tensor_backend(sched, filled, moe_cache->backend(il));
+        cb(filled, "ffn_moe_slots", il);
+        ggml_build_forward_expand(gf, filled);
+        return filled; // [n_expert_used, n_tokens]
+    }
+
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
