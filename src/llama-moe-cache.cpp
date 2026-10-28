@@ -1550,40 +1550,46 @@ struct llama_moe_cache::impl {
     }
 
     // fill slot s with the experts of layer il on the ring stream: the cached ones from the banks, the others from host memory
+    // the uploads from host memory go first: a copy between device buffers runs on the SMs, so it waits for the kernels of the
+    // compute stream, and on one stream the uploads queued behind it would wait too
     void ring_fill(ring & r, int32_t s, int32_t il) {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
         const int32_t * slots = g.slru.slot_map[il];
         char * base = (char *) ggml_backend_buffer_get_base(r.buf.get()) + s*r.slot_bytes;
-        size_t off = 0;
-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-            const ggml_tensor * w = l.experts[ip];
-            const int64_t n_expert = w->ne[2];
-            const size_t  nb2      = w->nb[2];
-            for (int64_t e = 0; e < n_expert; ) {
-                const bool cached = slots != nullptr && slots[e] >= 0;
-                int64_t n = 1;
-                while (e + n < n_expert && (cached ? slots[e + n] == slots[e] + n : (slots == nullptr || slots[e + n] < 0))) {
-                    n++;
+        for (const bool from_cache : { false, true }) {
+            size_t off = 0;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                const int64_t n_expert = w->ne[2];
+                const size_t  nb2      = w->nb[2];
+                for (int64_t e = 0; e < n_expert; ) {
+                    const bool cached = slots != nullptr && slots[e] >= 0;
+                    int64_t n = 1;
+                    while (e + n < n_expert && (cached ? slots[e + n] == slots[e] + n : (slots == nullptr || slots[e + n] < 0))) {
+                        n++;
+                    }
+                    if (cached == from_cache) {
+                        ggml_reset(ctx_views.get());
+                        ggml_tensor * dst = ggml_new_tensor_3d(ctx_views.get(), w->type, w->ne[0], w->ne[1], n);
+                        ggml_backend_tensor_alloc(r.buf.get(), dst, base + off + e*nb2);
+                        if (cached) {
+                            ggml_tensor * bank = g.banks[ip];
+                            ggml_tensor * src  = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], slots[e]*bank->nb[2]);
+                            ggml_backend_view_init(src);
+                            ggml_backend_tensor_copy_async(r.copy, r.copy, src, dst);
+                            stats_copy.hits  += n;
+                            stats_copy.bytes += n*nb2;
+                        } else {
+                            ggml_backend_tensor_set_async(r.copy, dst, (const char *) w->data + e*nb2, 0, n*nb2);
+                            stats_ring.misses += n;
+                            stats_ring.bytes  += n*nb2;
+                        }
+                    }
+                    e += n;
                 }
-                ggml_reset(ctx_views.get());
-                ggml_tensor * dst = ggml_new_tensor_3d(ctx_views.get(), w->type, w->ne[0], w->ne[1], n);
-                ggml_backend_tensor_alloc(r.buf.get(), dst, base + off + e*nb2);
-                if (cached) {
-                    ggml_tensor * bank = g.banks[ip];
-                    ggml_tensor * src  = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], slots[e]*bank->nb[2]);
-                    ggml_backend_view_init(src);
-                    ggml_backend_tensor_copy_async(r.copy, r.copy, src, dst);
-                    stats_copy.hits  += n;
-                    stats_copy.bytes += n*nb2;
-                } else {
-                    ggml_backend_tensor_set_async(r.copy, dst, (const char *) w->data + e*nb2, 0, n*nb2);
-                    stats_ring.misses += n;
-                    stats_ring.bytes  += n*nb2;
-                }
-                e += n;
+                off += ring_tensor_bytes(w);
             }
-            off += ring_tensor_bytes(w);
         }
         ggml_backend_event_record(r.filled[s], r.copy);
         r.layer[s] = il;
