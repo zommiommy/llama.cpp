@@ -344,6 +344,8 @@ extern "C" {
     // if the user returns false the scheduler simply copies the entire weight
     // the callback is called only for input weights in host buffers
     // the callback is called after all non-weight inputs of the split have been copied
+    // the callback is called before the scheduler waits for the backend to finish using `dst`: its writes to `dst` have to be
+    // ordered after the work already queued on the backend, e.g. by asynchronous copies on the backend
     // `src` is the tensor in the previous split
     // `dst` is the copy of `src` in the split
     // `graph` is the compute graph of the split
