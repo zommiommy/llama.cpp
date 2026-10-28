@@ -590,6 +590,8 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_MOE_CACHE_FILL,
+        GGML_OP_MOE_CACHE_JOIN,
 
         GGML_OP_UNARY,
 
@@ -2768,6 +2770,71 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // device-side lookup in a cache of experts kept in the slots of device banks, for a MoE layer whose experts stay in host memory
+    //
+    // ids:      [n_expert_used, n_tokens] i32, the experts selected by each token
+    // x:        [n_embd, n_tokens]        f32, the input of the experts, can be NULL when xchg is NULL
+    // slot_map: [n_expert, n_layer]       i32, the slot of each expert of each layer, -1 when it is not cached
+    // state:    [GGML_MOE_CACHE_STATE_SIZE(n_slots, n_ids) or more] i32, see below
+    // log:      [4 + 3*cap]               i32, record count, capacity, sequence number of the last post to the host, 1 unused,
+    //                                     then the records: (layer, slot, expert) per expert filled, (layer, slot, -1 - expert)
+    //                                     per selected expert found cached, (layer, -1, expert) per expert left to the host,
+    //                                     (layer, -2, expert) per expert skipped, once each
+    // banks:    [ne0, ne1, n_slots + 1]   the device storage of the slots, one per expert tensor of the layer, at most 3
+    // host:     the expert tensors of layer il in host memory the device can read, one per bank
+    // xchg:     can be NULL, see ggml_moe_cache_xchg
+    // skip_rank: when > 0, a missing expert that no token selects at a rank below skip_rank (rank 0 is the expert of the largest
+    //           weight) is neither copied nor left to the host: its outputs are zero, and the other weights stay as they are
+    // res:      [n_expert_used, n_tokens] i32, the slot of each selected expert
+    //
+    // state holds the cursor into the victim list, the victim count, the copy count, the sequence number and the number of
+    // (token, expert) pairs of its last post to the host, the number of pairs it skipped and 2 unused values, then the owner of
+    // each slot (layer*n_expert + expert, -1 when empty), then the victim slots in eviction order, then the copy list of the
+    // last call, then the positions of its skipped pairs in the [n_expert_used, n_tokens] selection
+    // with xchg, up to xchg->cpu_max missing experts are left to the host: their pairs and inputs are posted to xchg, the host
+    // computes them; the pairs left to the host and the skipped pairs point at victim slots that hold no other expert of their
+    // token in res, and ggml_moe_cache_join writes their outputs
+    // the other missing experts take the next victims that hold no expert selected by the batch and are copied there from host
+    // memory; slot_map, state, log and the banks are updated in place
+    //
+#define GGML_MOE_CACHE_STATE_SIZE(n_slots, n_ids) (8 + 2*(n_slots) + 3*(n_ids))
+
+    // pinned host memory the device reads and writes directly, for the experts a lookup leaves to the host, laid out as:
+    // ctl i32[16] (posted sequence number, done sequence number, pair count, layer, 12 unused), expert i32[max_pairs],
+    // position (expert slot of the pair in the [n_expert_used, n_tokens] selection) i32[max_pairs], x f32[max_pairs, n_embd],
+    // y f32[max_pairs, n_embd]
+    // the device numbers its posts; the host sets the done number to the posted one once y holds the outputs of the pairs
+    struct ggml_moe_cache_xchg {
+        void * base;
+        int    max_pairs;
+        int    cpu_max;   // missing experts of a layer left to the host at most
+    };
+
+#define GGML_MOE_CACHE_XCHG_SIZE(max_pairs, n_embd) (sizeof(int32_t)*(16 + 2*(size_t) (max_pairs)) + 2*sizeof(float)*(size_t) (max_pairs)*(n_embd))
+
+    GGML_API struct ggml_tensor * ggml_moe_cache_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * slot_map,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * log,
+            struct ggml_tensor ** banks,
+            const void         ** host,
+            int                   n_banks,
+            int                   il,
+            const struct ggml_moe_cache_xchg * xchg,
+            int                   skip_rank);
+
+    // writes the outputs of the pairs a lookup did not leave to the device into experts: zero for the skipped ones, and those the
+    // host computed, once it has
+    // experts: [n_embd, n_expert_used, n_tokens] f32, the outputs of the selected experts, updated in place and returned
+    // lookup:  the result of ggml_moe_cache_fill
+    GGML_API struct ggml_tensor * ggml_moe_cache_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * lookup);
 
     // custom operators
 
