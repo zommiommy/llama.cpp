@@ -5583,7 +5583,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_cuda_graph_compute_part(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -5644,6 +5644,47 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // a CUDA graph takes about a microsecond per node to launch and the device starts it only then, so the decode step of a large
+    // MoE, thousands of nodes in one graph once its expert cache is looked up on the device, leaves the device idle for 5 ms:
+    // launched in parts, the device runs a part while the next one launches; the first part ends at the first lookup, so the
+    // device starts early, and each part may be twice as large as the last, up to max_nodes nodes
+    // a part ends before a MoE cache lookup: no fused kernel spans one, so cutting there keeps the kernels and their rounding
+    static const int max_nodes = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_MAX_NODES");
+        return env != nullptr ? atoi(env) : 512;
+    }();
+
+    auto compute = [&](int i0, int i1) {
+        // a view of the nodes, as ggml_graph_view makes it; a part of a reused graph keeps its uid, so it is reused too
+        ggml_cgraph part = *cgraph;
+        part.size      = 0;
+        part.n_nodes   = i1 - i0;
+        part.n_leafs   = 0;
+        part.nodes     = cgraph->nodes + i0;
+        part.grads     = nullptr;
+        part.grad_accs = nullptr;
+        part.leafs     = nullptr;
+        return ggml_backend_cuda_graph_compute_part(backend, &part);
+    };
+
+    int i0    = 0;
+    int limit = 1;
+    if (max_nodes > 0) {
+        for (int i = 1; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_MOE_CACHE_FILL && i - i0 >= limit) {
+                const ggml_status status = compute(i0, i);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                limit = std::min(max_nodes, 2*(i - i0));
+                i0 = i;
+            }
+        }
+    }
+    return i0 == 0 ? ggml_backend_cuda_graph_compute_part(backend, cgraph) : compute(i0, cgraph->n_nodes);
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
