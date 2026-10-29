@@ -947,6 +947,7 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    size_t gran = 0; // growable buffer types: the size of the pages they commit, 0 for the VMM granularity
 };
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -1645,7 +1646,7 @@ static const char * ggml_backend_cuda_growable_buffer_type_get_name(ggml_backend
 static ggml_backend_buffer_t ggml_backend_cuda_growable_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t gran = ggml_cuda_info().devices[buft_ctx->device].vmm_granularity;
+    size_t gran = buft_ctx->gran ? buft_ctx->gran : ggml_cuda_info().devices[buft_ctx->device].vmm_granularity;
     if (gran == 0) {
         return nullptr;
     }
@@ -1671,7 +1672,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_growable_buffer_type_alloc_buffer
 
 static size_t ggml_backend_cuda_growable_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
-    const size_t gran = ggml_cuda_info().devices[ctx->device].vmm_granularity;
+    const size_t gran = ctx->gran ? ctx->gran : ggml_cuda_info().devices[ctx->device].vmm_granularity;
     return gran ? gran : 128;
 }
 
@@ -6922,6 +6923,39 @@ static size_t ggml_backend_cuda_device_get_lazy_granule(ggml_backend_dev_t dev) 
     return 0;
 }
 
+// a demand-paged buffer type that commits and releases its memory in pages of gran bytes, rounded to the VMM
+// granularity: the driver's work is per page, so a buffer that moves GBs at once pays far less with coarse pages
+static ggml_backend_buffer_type_t ggml_backend_cuda_dev_buffer_type_lazy_gran(ggml_backend_dev_t dev, size_t gran) {
+#if defined(GGML_USE_VMM)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const int    device   = dev_ctx->device;
+    const size_t vmm_gran = ggml_cuda_info().devices[device].vmm_granularity;
+    if (!ggml_cuda_info().devices[device].vmm || vmm_gran == 0) {
+        return nullptr;
+    }
+    gran = std::max<size_t>(1, (gran + vmm_gran - 1)/vmm_gran)*vmm_gran;
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    // the nodes of a map keep their addresses
+    static std::map<std::pair<int, size_t>, ggml_backend_buffer_type> types;
+    auto it = types.find({ device, gran });
+    if (it == types.end()) {
+        const std::string name = GGML_CUDA_NAME + std::to_string(device) + " (lazy, " + std::to_string(gran >> 20) + " MiB pages)";
+        it = types.emplace(std::make_pair(device, gran), ggml_backend_buffer_type {
+            /* .iface    = */ ggml_backend_cuda_growable_buffer_type_interface,
+            /* .device   = */ dev,
+            /* .context  = */ new ggml_backend_cuda_buffer_type_context{ device, name, gran },
+        }).first;
+    }
+    return &it->second;
+#else
+    GGML_UNUSED_VARS(dev, gran);
+    return nullptr;
+#endif
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -7040,6 +7074,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_type_lazy_gran") == 0) {
+        return (void *)ggml_backend_cuda_dev_buffer_type_lazy_gran;
     }
     return nullptr;
 }
