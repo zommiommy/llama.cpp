@@ -2128,6 +2128,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MOE_CACHE_FILL:
         case GGML_OP_MOE_CACHE_JOIN:
+        case GGML_OP_MOE_CACHE_PREFETCH:
             {
                 GGML_ABORT("the MoE cache lookup works on device banks, it has no CPU implementation");
             }
@@ -2321,6 +2322,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_MOE_CACHE_FILL:
         case GGML_OP_MOE_CACHE_JOIN:
+        case GGML_OP_MOE_CACHE_PREFETCH:
             {
                 n_tasks = 1;
             } break;
