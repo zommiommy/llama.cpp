@@ -54,7 +54,12 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
     LLM_FUSED_OP_TOP_K_MASK,
+    LLM_FUSED_OP_QSA_CELLS,
 };
+
+// QSA batches of at least this many tokens attend to the cell lists of their selection (llama_cparams::fused_qsa_cells),
+// smaller ones to a selection mask
+static constexpr uint32_t LLAMA_QSA_CELLS_MIN_TOKENS = 64;
 
 enum llm_ffn_op_type : int {
     LLM_FFN_NONE = 0,           // sentinel: unset; archs must assign before use

@@ -49,6 +49,8 @@ struct llama_cparams {
     bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
+    bool fused_qsa_cells;    // QSA prompt batches attend to lists of their selected cells instead of a mask
+    bool auto_fqsc;
     bool no_perf;
     bool op_offload;
     bool kv_unified;
