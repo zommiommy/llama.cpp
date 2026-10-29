@@ -50,9 +50,10 @@ GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, i
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 
 // called when a reservation needs size_new bytes of a buffer of type buft that holds size_cur bytes (0 if it has no buffer yet)
-// a buffer that has to grow is replaced after the call, which can make room for it
-// a buffer larger than the reservation is kept, unless the callback returns true: then it is replaced by one of size_new bytes
-typedef bool (*ggml_gallocr_resize_callback)(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data);
+// returns the size the buffer gets, at least size_new: a buffer that has to grow is replaced by one of that size, which can
+// leave room for the next reservations, and the call can make room for it; a larger buffer is kept if the returned size is
+// size_cur or more, else it is replaced by one of the returned size
+typedef size_t (*ggml_gallocr_resize_callback)(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data);
 GGML_API void           ggml_gallocr_set_resize_callback(ggml_gallocr_t galloc, ggml_gallocr_resize_callback callback, void * user_data);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
