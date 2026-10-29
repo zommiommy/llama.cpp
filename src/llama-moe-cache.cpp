@@ -499,8 +499,19 @@ struct llama_moe_cache::impl {
                 d.backend = backends[i];
                 d.buft    = bufts[i];
                 if (free_target > 0) {
-                    // demand paging lets the banks reserve the whole budget and hold memory for the active slots only
-                    ggml_backend_buffer_type_t buft_lazy = ggml_backend_dev_buffer_type_lazy(ggml_backend_get_device(d.backend));
+                    // demand paging lets the banks reserve the whole budget and hold memory for the active slots only;
+                    // a prompt moves GBs of them, and the driver commits and releases memory per page: 2 MiB pages
+                    // cost about 350 ms per prompt, so the banks take coarse ones where the backend has them; each of
+                    // the banks keeps half a page above its slots on average
+                    constexpr size_t page_bytes = 32u*1024*1024;
+                    ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+                    using buft_lazy_gran_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t);
+                    auto * buft_lazy_gran = (buft_lazy_gran_t) ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_buffer_type_lazy_gran");
+                    ggml_backend_buffer_type_t buft_lazy = buft_lazy_gran ? buft_lazy_gran(dev, page_bytes) : nullptr;
+                    if (buft_lazy == nullptr) {
+                        buft_lazy = ggml_backend_dev_buffer_type_lazy(dev);
+                    }
                     if (buft_lazy != nullptr) {
                         d.buft    = buft_lazy;
                         d.elastic = true;
