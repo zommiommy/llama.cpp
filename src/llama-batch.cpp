@@ -121,6 +121,8 @@ bool llama_batch_allocr::init(
         }
     }
 
+    // the rows of an embedding batch are read in place, they are stored in the order of the entries: they can take GBs
+    const float * embd_rows = nullptr;
     if (mixed) {
         embd_vec.assign((size_t) n_tok*n_embd, 0.0f);
         for (int32_t i = 0; i < n_tok; ++i) {
@@ -129,8 +131,10 @@ bool llama_batch_allocr::init(
                 std::copy(src, src + n_embd, embd_vec.data() + (size_t) i*n_embd);
             }
         }
+        embd_rows = embd_vec.data();
     } else if (has_embd) {
-        embd_vec = batch_inp.embd;
+        GGML_ASSERT(batch_inp.embd.size() >= (size_t) n_tok*n_embd);
+        embd_rows = batch_inp.embd.data();
     }
 
     if (has_state) {
@@ -229,7 +233,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = const_cast<float *>(embd_rows);
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -886,9 +890,16 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
+    // the rows of consecutive entries are read in place from the batch, which outlives the ubatches of its decode
+    bool embd_in_place = use_embd;
+    for (size_t i = 1; i < idxs.size() && embd_in_place; ++i) {
+        embd_in_place = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
     udata->token     .resize(n_tokens);
-    udata->embd      .resize(n_embd_all);
-    udata->embd_state.resize(n_state_all);
+    // every row of embd and embd_state that is copied is appended below, reserved so that they are not zero-filled first
+    udata->embd      .reserve(embd_in_place ? 0 : n_embd_all);
+    udata->embd_state.reserve(n_state_all);
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
@@ -908,8 +919,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (use_embd) {
-            memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+        if (use_embd && !embd_in_place) {
+            const float * src = batch.embd + (int64_t) idxs[i]*n_embd;
+            udata->embd.insert(udata->embd.end(), src, src + n_embd);
         }
 
         if (mixed) {
@@ -917,7 +929,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         if (has_state) {
-            memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
+            const float * src = state_vec.data() + (int64_t) idxs[i]*n_embd_state;
+            udata->embd_state.insert(udata->embd_state.end(), src, src + n_embd_state);
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -965,7 +978,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
-        /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
+        /*.embd         =*/ use_embd  ? (embd_in_place ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data()) : nullptr,
         /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
