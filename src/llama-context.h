@@ -284,7 +284,7 @@ private:
 
     // ggml_backend_sched resize callback of an elastic MoE cache: prompt and generation graphs never run at the same time, so
     // the device compute buffers follow each reservation down, and the cache makes room for them before they grow
-    static bool sched_compute_resize(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data);
+    static size_t sched_compute_resize(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data);
 
     // the device compute buffers are sized to each reservation, see sched_compute_resize
     bool compute_elastic() const;

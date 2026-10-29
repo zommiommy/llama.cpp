@@ -935,9 +935,16 @@ static bool ggml_gallocr_reserve_n_impl(
         if (galloc->resize_callback != NULL && !no_alloc && !shared) {
             const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
             if (realloc || new_size < cur_size) {
-                // the callback makes room for a buffer that grows and decides if one that would be too large shrinks
-                const bool shrink = galloc->resize_callback(galloc->bufts[i], cur_size, new_size, galloc->resize_callback_user_data);
-                realloc = realloc || shrink;
+                const size_t size = MAX(new_size, galloc->resize_callback(galloc->bufts[i], cur_size, new_size, galloc->resize_callback_user_data));
+                realloc = realloc || size < cur_size;
+
+                // the vbuffer allocates each chunk at its max size: the room beyond the reservation goes to the last chunk
+                struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[i];
+                if (realloc && size > new_size && talloc->n_chunks > 0) {
+                    struct tallocr_chunk * last = talloc->chunks[talloc->n_chunks - 1];
+                    const size_t max_size = ggml_backend_buft_get_max_size(galloc->bufts[i]);
+                    last->max_size += MIN(size - new_size, max_size > last->max_size ? max_size - last->max_size : 0);
+                }
             }
         }
         if (realloc) {
