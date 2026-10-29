@@ -2818,14 +2818,16 @@ size_t llama_context::sched_compute_resize(ggml_backend_buffer_type_t buft, size
 
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // a smaller difference is not worth a reallocation: the cache grows only into more than two of its steps of free memory
+    // the ubatches of a prompt need about the same memory (3125 to 3812 MiB for those of a 32K prompt at ub8192), and a
+    // reallocation between them takes about 60 ms and resizes the cache twice: a buffer shrinks only for a batch that needs
+    // less than half of it, as the decode after a prompt, and by more than two of the cache's steps of free memory
     constexpr size_t shrink_min = 256*1024*1024;
 
     size_t size = size_cur;
     if (size_new > size_cur) {
         size = size_grow;
         lctx->moe_cache->make_room(ggml_backend_buft_get_device(buft), size - size_cur);
-    } else if (size_cur - size_new >= shrink_min) {
+    } else if (size_new < size_cur/2 && size_cur - size_new >= shrink_min) {
         size = size_new;
     }
     if (size != size_cur) {
