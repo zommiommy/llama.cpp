@@ -7203,6 +7203,15 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_dev_buffer_type_lazy_gran(gg
 #endif
 }
 
+// copies n ranges between buffers of the device of the backend on its stream, in a few launches: a copy per range leaves
+// the stream idle between thousands of small copies, as the experts copied from a cache into a staging buffer
+static void ggml_backend_cuda_copy_ranges_async(ggml_backend_t backend, const void * const * src, void * const * dst,
+        const size_t * size, int n) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_cache_copy_ranges(cuda_ctx->stream(), src, dst, size, n);
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -7324,6 +7333,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_buffer_type_lazy_gran") == 0) {
         return (void *)ggml_backend_cuda_dev_buffer_type_lazy_gran;
+    }
+    if (strcmp(name, "ggml_backend_copy_ranges_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_ranges_async;
     }
     return nullptr;
 }
