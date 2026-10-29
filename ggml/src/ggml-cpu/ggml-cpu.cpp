@@ -483,6 +483,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
         case GGML_OP_MOE_CACHE_FILL:
         case GGML_OP_MOE_CACHE_JOIN:
+        case GGML_OP_MOE_CACHE_PREFETCH:
             return false; // device banks
         default:
             return true;

@@ -2600,6 +2600,17 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         ggml_backend_sched_set_tensor_backend(sched, filled, moe_cache->backend(il));
         cb(filled, "ffn_moe_slots", il);
         ggml_build_forward_expand(gf, filled);
+
+        // the router of the next layer ranks its experts from the input of this one: the copies of those the cache misses run
+        // while this layer computes, and the lookup of the next layer waits for them
+        if (ggml_tensor * router = moe_cache->get_prefetch_router(il, ids->ne[1], ids->ne[0])) {
+            ggml_tensor * pre = moe_cache->build_prefetch(ctx0, build_lora_mm(router, cur), filled, il);
+            if (ggml_backend_supports_op(moe_cache->backend(il), pre)) {
+                ggml_backend_sched_set_tensor_backend(sched, pre, moe_cache->backend(il));
+                cb(pre, "ffn_moe_prefetch", il);
+                ggml_build_forward_expand(gf, pre);
+            }
+        }
         return filled; // [n_expert_used, n_tokens]
     }
 

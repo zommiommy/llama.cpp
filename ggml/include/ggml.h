@@ -595,6 +595,7 @@ extern "C" {
         GGML_OP_RANGE_MASK,
         GGML_OP_MOE_CACHE_FILL,
         GGML_OP_MOE_CACHE_JOIN,
+        GGML_OP_MOE_CACHE_PREFETCH,
 
         GGML_OP_UNARY,
 
@@ -2822,7 +2823,8 @@ extern "C" {
     // log:      [4 + 3*cap]               i32, record count, capacity, sequence number of the last post to the host, 1 unused,
     //                                     then the records: (layer, slot, expert) per expert filled, (layer, slot, -1 - expert)
     //                                     per selected expert found cached, (layer, -1, expert) per expert left to the host,
-    //                                     (layer, -2, expert) per expert skipped, once each
+    //                                     (layer, -2, expert) per expert skipped, once each, and
+    //                                     (layer | GGML_MOE_CACHE_LOG_PREFETCH, slot, expert) per expert ggml_moe_cache_prefetch filled
     // banks:    [ne0, ne1, n_slots + 1]   the device storage of the slots, one per expert tensor of the layer, at most 3
     // host:     the expert tensors of layer il in host memory the device can read, one per bank
     // xchg:     can be NULL, see ggml_moe_cache_xchg
@@ -2841,6 +2843,7 @@ extern "C" {
     // memory; slot_map, state, log and the banks are updated in place
     //
 #define GGML_MOE_CACHE_STATE_SIZE(n_slots, n_ids) (8 + 2*(n_slots) + 3*(n_ids))
+#define GGML_MOE_CACHE_LOG_PREFETCH 0x10000
 
     // pinned host memory the device reads and writes directly, for the experts a lookup leaves to the host, laid out as:
     // ctl i32[16] (posted sequence number, done sequence number, pair count, layer, 12 unused), expert i32[max_pairs],
@@ -2877,6 +2880,36 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
             struct ggml_tensor  * lookup);
+
+    // copies up to n_copies experts of layer il that a router ranks highest and the cache misses into victim slots, on a stream
+    // of their own while the graph goes on; the next ggml_moe_cache_fill of the device and the end of the graph wait for the
+    // copies
+    // logits:   [n_expert, n_tokens]      f32, the router logits of layer il, rows contiguous; the first n_rank experts of each
+    //                                     token are expected, the copies go by rank: the first expert of every token, then the
+    //                                     second, ...
+    // after:    the ggml_moe_cache_fill of the previous layer, which runs first; n_rank*n_tokens and n_copies are at most the size
+    //           of its result
+    // keep:     after caches into the same banks: the slots in its result are read by its experts while the copies run, so they
+    //           are not victims
+    // slot_map, state, log, banks, host: those of ggml_moe_cache_fill for layer il
+    // res:      [1] i32, unused
+    //
+    // the victims spare the expected experts; the copies take the copy list of state and the cursor moves past their victims;
+    // the counts and the skipped pairs a fill leaves for its join stay as they are
+    GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * after,
+            struct ggml_tensor  * slot_map,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * log,
+            struct ggml_tensor ** banks,
+            const void         ** host,
+            int                   n_banks,
+            int                   il,
+            bool                  keep,
+            int                   n_rank,
+            int                   n_copies);
 
     // custom operators
 
