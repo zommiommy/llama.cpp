@@ -136,6 +136,45 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// one warp per list: the length up to its last cell
+static __global__ void flash_attn_cells_count(
+        const int32_t * __restrict__ lists, int32_t * __restrict__ counts, const int64_t n_lists, const int n_kv_max) {
+    const int64_t list = int64_t(blockIdx.x)*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (list >= n_lists) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int32_t * row = lists + list*n_kv_max;
+
+    int count = 0;
+    for (int i0 = ((n_kv_max - 1)/WARP_SIZE)*WARP_SIZE; i0 >= 0; i0 -= WARP_SIZE) {
+        const int i = i0 + lane;
+        const unsigned live = __ballot_sync(0xffffffff, i < n_kv_max && row[i] >= 0);
+        if (live) {
+            count = i0 + WARP_SIZE - __clz(live);
+            break;
+        }
+    }
+    if (lane == 0) {
+        counts[list] = count;
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_flash_attn_cells_count(const int32_t * lists, int32_t * counts, int64_t n_lists, int32_t n_kv_max, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(lists, counts, n_lists, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    constexpr int lists_per_block = 8;
+    const dim3 blocks_num((n_lists + lists_per_block - 1)/lists_per_block, 1, 1);
+    const dim3 block_dim(lists_per_block*WARP_SIZE, 1, 1);
+    flash_attn_cells_count<<<blocks_num, block_dim, 0, stream>>>(lists, counts, n_lists, n_kv_max);
+    CUDA_CHECK(cudaGetLastError());
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #ifdef GGML_USE_MUSA
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
@@ -145,6 +184,11 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    // ggml_flash_attn_cells has a list per query and no other kernel
+    if (dst->op == GGML_OP_FLASH_ATTN_CELLS) {
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && ncols1 == 1;
+    }
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -175,6 +219,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
 #if !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
+        // the lists of ggml_flash_attn_cells belong to single queries
+        if (dst->op == GGML_OP_FLASH_ATTN_CELLS) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
+            return;
+        }
         // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
         constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
         if (!(has_wide_sparse && Q->ne[1] > 32/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
@@ -183,6 +232,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 #endif // !defined(GGML_USE_MUSA)
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
@@ -221,7 +271,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // the lists of ggml_flash_attn_cells take the place of the mask
+    bool use_gqa_opt = (mask || dst->op == GGML_OP_FLASH_ATTN_CELLS) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -576,7 +627,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // the lists of ggml_flash_attn_cells take the place of the mask
+    const bool cells = dst->op == GGML_OP_FLASH_ATTN_CELLS;
+    bool gqa_opt_applies = gqa_ratio >= 2 && (mask || cells) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -646,6 +699,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // the lists of ggml_flash_attn_cells are read by the sparse MMA kernel only, the GQA heads are the columns of a query
+    if (cells) {
+        const bool sparse = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && gqa_opt_applies && gqa_ratio > 4 &&
+            ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8);
+        return sparse ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -743,7 +803,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_CELLS);
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];

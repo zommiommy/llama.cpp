@@ -1069,7 +1069,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_CELLS
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
@@ -3415,6 +3415,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_CELLS:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -3464,6 +3465,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_TOP_K_CELLS:
+            ggml_cuda_op_top_k_cells(ctx, dst);
+            break;
+        case GGML_OP_RANGE_MASK:
+            ggml_cuda_op_range_mask(ctx, dst);
             break;
         case GGML_OP_MOE_CACHE_FILL:
             ggml_cuda_moe_cache_fill(ctx, dst);
@@ -7017,6 +7024,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_CELLS:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
@@ -7031,6 +7039,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
+            return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_TOP_K_CELLS:
+            return ggml_cuda_op_top_k_cells_supported(op);
+        case GGML_OP_RANGE_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
         case GGML_OP_MOE_CACHE_FILL:
             return ggml_cuda_moe_cache_fill_supported(op);

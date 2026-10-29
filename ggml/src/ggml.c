@@ -1101,6 +1101,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "TOP_K_CELLS",
+    "FLASH_ATTN_CELLS",
+    "RANGE_MASK",
     "MOE_CACHE_FILL",
     "MOE_CACHE_JOIN",
 
@@ -1120,7 +1123,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,6 +1222,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "top_k_cells(top_k, score, blocks, extra)",
+    "flash_attn_cells(q, k, v, cells)",
+    "range_mask(ranges)",
     "moe_cache_fill(ids, slot_map, state, log, banks, x)",
     "moe_cache_join(experts, state)",
 
@@ -1238,7 +1244,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3324,6 +3330,7 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_CELLS:
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -5649,6 +5656,41 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// ggml_flash_attn_cells
+
+struct ggml_tensor * ggml_flash_attn_cells(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * cells,
+        float                 scale) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+
+    GGML_ASSERT(cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cells));
+    GGML_ASSERT(cells->ne[0] <= INT32_MAX);
+    GGML_ASSERT(cells->ne[1] == q->ne[1] && cells->ne[2] == 1 && cells->ne[3] == q->ne[3]);
+
+    // permute(0, 2, 1, 3)
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    // the op params of ggml_flash_attn_ext, with the list length as the bound on the cells a query reads
+    float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 4, (int32_t) cells->ne[0]);
+
+    result->op     = GGML_OP_FLASH_ATTN_CELLS;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[5] = cells;
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -6712,6 +6754,69 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_top_k_cells
+
+struct ggml_tensor * ggml_top_k_cells(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra,
+        int64_t               n_cells) {
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_cells > 0 && n_cells <= INT32_MAX);
+
+    if (score) {
+        GGML_ASSERT(score->type == GGML_TYPE_F32);
+        GGML_ASSERT(score->ne[1] == top_k->ne[1] && score->ne[2] == top_k->ne[2] && score->ne[3] == top_k->ne[3]);
+    }
+
+    if (blocks) {
+        GGML_ASSERT(blocks->type == GGML_TYPE_I32);
+        GGML_ASSERT(blocks->ne[2] == 1 && blocks->ne[3] == 1);
+        GGML_ASSERT(!score || blocks->ne[1] == score->ne[0]);
+    }
+
+    if (extra) {
+        GGML_ASSERT(extra->type == GGML_TYPE_I32);
+        GGML_ASSERT(extra->ne[1] == top_k->ne[1] && extra->ne[2] == top_k->ne[2] && extra->ne[3] == top_k->ne[3]);
+    }
+
+    const int64_t n_blk   = blocks ? blocks->ne[0] : 1;
+    const int64_t n_extra = extra  ? extra->ne[0]  : 0;
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, top_k->ne[0]*n_blk + n_extra, top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_cells);
+
+    result->op     = GGML_OP_TOP_K_CELLS;
+    result->src[0] = top_k;
+    result->src[1] = score;
+    result->src[2] = blocks;
+    result->src[3] = extra;
+
+    return result;
+}
+
+// ggml_range_mask
+
+struct ggml_tensor * ggml_range_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ranges,
+        int64_t               n_cols,
+        enum ggml_type        type) {
+    GGML_ASSERT(ranges->type == GGML_TYPE_I32 && ranges->ne[0] == 2);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(n_cols > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_cols, ranges->ne[1], ranges->ne[2], ranges->ne[3]);
+
+    result->op     = GGML_OP_RANGE_MASK;
+    result->src[0] = ranges;
 
     return result;
 }

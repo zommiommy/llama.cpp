@@ -8844,6 +8844,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * cells = dst->src[5]; // ggml_flash_attn_cells: each query reads its listed cells only
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8939,6 +8940,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const int32_t     * cp = cells ? (const int32_t *) ((const char *) cells->data + iq1*cells->nb[1] + iq3*cells->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8955,7 +8957,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        const int64_t n_iter = cp ? cells->ne[0] : ic_end - ic_start;
+
+        for (int64_t it = 0; it < n_iter; ++it) {
+            const int64_t ic = cp ? cp[it] : ic_start + it;
+            if (ic < 0 || ic >= nek1) {
+                continue;
+            }
+
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9475,7 +9484,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int nth = params->nth;
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
-    const bool use_ref = params->use_ref;
+    // a list of cells per query has neither: one chunk walks each list
+    const bool use_ref = params->use_ref || dst->op == GGML_OP_FLASH_ATTN_CELLS;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
@@ -11719,6 +11729,133 @@ void ggml_compute_forward_top_k_mask(
             for (int64_t j = 0; j < n_extra; ++j) {
                 keep(*(const int32_t *) (extra_row + j*extra->nb[0]));
             }
+        }
+    }
+}
+
+// ggml_compute_forward_top_k_cells
+
+void ggml_compute_forward_top_k_cells(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * top_k  = dst->src[0];
+    const ggml_tensor * score  = dst->src[1];
+    const ggml_tensor * blocks = dst->src[2];
+    const ggml_tensor * extra  = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+
+    const int64_t n_cells = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_sel   = dst->ne[0];
+    const int64_t ne1     = dst->ne[1];
+    const int64_t ne2     = dst->ne[2];
+    const int64_t n_rows  = ggml_nrows(dst);
+    const int64_t n_top   = top_k->ne[0];
+    const int64_t n_blk   = blocks ? blocks->ne[0] : 1;
+    const int64_t n_pick  = blocks ? blocks->ne[1] : score ? score->ne[0] : n_cells;
+    const int64_t n_extra = extra ? extra->ne[0] : 0;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    std::vector<int32_t> picks;
+    picks.reserve(n_top);
+
+    for (int64_t ir = ith; ir < n_rows; ir += nth) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1*ne2);
+
+        int32_t * dst_row = (int32_t *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        int64_t n = 0;
+        auto keep = [&](int32_t c) {
+            if (c >= 0 && c < n_cells) {
+                dst_row[n++] = c;
+            }
+        };
+
+        const char * top_k_row = (const char *) top_k->data + i1*top_k->nb[1] + i2*top_k->nb[2] + i3*top_k->nb[3];
+
+        // the live picks in ascending order
+        picks.clear();
+        for (int64_t j = 0; j < n_top; ++j) {
+            const int32_t p = *(const int32_t *) (top_k_row + j*top_k->nb[0]);
+            if (p < 0 || p >= n_pick) {
+                continue;
+            }
+            if (score) {
+                const float s = *(const float *) ((const char *) score->data
+                    + p*score->nb[0] + i1*score->nb[1] + i2*score->nb[2] + i3*score->nb[3]);
+                if (!(s > -INFINITY)) {
+                    continue;
+                }
+            }
+            picks.push_back(p);
+        }
+        std::sort(picks.begin(), picks.end());
+
+        for (const int32_t p : picks) {
+            if (!blocks) {
+                keep(p);
+                continue;
+            }
+            for (int64_t k = 0; k < n_blk; ++k) {
+                keep(*(const int32_t *) ((const char *) blocks->data + k*blocks->nb[0] + p*blocks->nb[1]));
+            }
+        }
+
+        if (extra) {
+            const char * extra_row = (const char *) extra->data + i1*extra->nb[1] + i2*extra->nb[2] + i3*extra->nb[3];
+            for (int64_t j = 0; j < n_extra; ++j) {
+                keep(*(const int32_t *) (extra_row + j*extra->nb[0]));
+            }
+        }
+
+        for (; n < n_sel; ++n) {
+            dst_row[n] = -1;
+        }
+    }
+}
+
+// ggml_compute_forward_range_mask
+
+void ggml_compute_forward_range_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * ranges = dst->src[0];
+
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
+
+    const int64_t n_cols = dst->ne[0];
+    const int64_t ne1    = dst->ne[1];
+    const int64_t ne2    = dst->ne[2];
+    const int64_t n_rows = ggml_nrows(dst);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t ir = ith; ir < n_rows; ir += nth) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1*ne2);
+
+        const int32_t * range = (const int32_t *) ((const char *) ranges->data + i1*ranges->nb[1] + i2*ranges->nb[2] + i3*ranges->nb[3]);
+        const int64_t c0 = std::min<int64_t>(std::max<int64_t>(range[0], 0), n_cols);
+        const int64_t c1 = std::min<int64_t>(std::max<int64_t>(*(const int32_t *) ((const char *) range + ranges->nb[0]), c0), n_cols);
+
+        char * row = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
+        if (dst->type == GGML_TYPE_F16) {
+            ggml_fp16_t * r = (ggml_fp16_t *) row;
+            std::fill(r,      r + c0,     GGML_CPU_FP32_TO_FP16(-INFINITY));
+            std::fill(r + c0, r + c1,     GGML_CPU_FP32_TO_FP16(0.0f));
+            std::fill(r + c1, r + n_cols, GGML_CPU_FP32_TO_FP16(-INFINITY));
+        } else {
+            float * r = (float *) row;
+            std::fill(r,      r + c0,     -INFINITY);
+            std::fill(r + c0, r + c1,     0.0f);
+            std::fill(r + c1, r + n_cols, -INFINITY);
         }
     }
 }

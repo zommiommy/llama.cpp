@@ -590,6 +590,9 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_TOP_K_CELLS,
+        GGML_OP_FLASH_ATTN_CELLS,
+        GGML_OP_RANGE_MASK,
         GGML_OP_MOE_CACHE_FILL,
         GGML_OP_MOE_CACHE_JOIN,
 
@@ -2536,6 +2539,19 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // ggml_flash_attn_ext without a mask: query i attends to the K/V cells listed in row i of cells only
+    //
+    // cells: [n_sel, n_queries, 1, ne3] i32, the cells of each query, entries below 0 are skipped
+    // res:   as ggml_flash_attn_ext
+    //
+    GGML_API struct ggml_tensor * ggml_flash_attn_cells(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * cells,
+            float                 scale);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2770,6 +2786,32 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // the cells ggml_top_k_mask keeps, as a list per row: the member cells of the live picks in ascending pick order, then
+    // the extra cells, without the cells out of [0, n_cells), then -1 up to the end of the row; unlike the mask, a cell
+    // named twice is listed twice. picks of consecutive cells give cells in the order an attention over the mask reads them
+    //
+    // top_k, score, blocks, extra: see ggml_top_k_mask
+    // res: [n_top*n_blk + n_extra, ne1, ne2, ne3] i32
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_cells(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra,
+            int64_t               n_cells);
+
+    // a mask that keeps one range of columns per row
+    //
+    // ranges: [2, ne1, ne2, ne3] i32, the first column kept and the column after the last one kept
+    // res:    [n_cols, ne1, ne2, ne3] f16 or f32, 0 in [ranges[0], ranges[1]) and -inf elsewhere
+    //
+    GGML_API struct ggml_tensor * ggml_range_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ranges,
+            int64_t               n_cols,
+            enum ggml_type        type);
 
     // device-side lookup in a cache of experts kept in the slots of device banks, for a MoE layer whose experts stay in host memory
     //

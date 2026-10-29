@@ -1433,7 +1433,7 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     allow = allow && tensor->op != GGML_OP_ROPE;
 
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
-    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT && tensor->op != GGML_OP_FLASH_ATTN_CELLS;
 
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -2558,6 +2558,7 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_CELLS:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_CUMSUM:

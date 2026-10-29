@@ -52,7 +52,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_CELLS);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -726,6 +726,9 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// the length of each list of ggml_flash_attn_cells up to its last cell, the kernel masks the entries below 0 before it
+void ggml_cuda_flash_attn_cells_count(const int32_t * lists, int32_t * counts, int64_t n_lists, int32_t n_kv_max, cudaStream_t stream);
+
 // the sparse kernels read only the cells in their index lists and row 0, which a padded slot gathers under a -inf mask:
 // dequantize those rows of K or V to f16 instead of the whole tensor, which at long contexts is most of its time
 // one block per (list entry, list, head); entry n_kv_max is row 0
@@ -1047,6 +1050,10 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * cells = dst->src[5]; // ggml_flash_attn_cells: the sparse lists are given, one per query
+
+    // the sequences the mask or the lists of cells hold, the kernels read it only with one of them
+    const int64_t n_seq_lists = mask ? mask->ne[3] : cells ? cells->ne[3] : 0;
 
     ggml_tensor * KQV = dst;
 
@@ -1090,7 +1097,16 @@ void launch_fattn(
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
     int32_t n_kv_max = 0;
     size_t  n_lists  = 0;
-    if (use_sparse) {
+    if (use_sparse && cells) {
+        GGML_ASSERT(ncols1 == 1 && mask == nullptr);
+        n_kv_max = cells->ne[0];
+        n_lists  = size_t(ntiles_x) * cells->ne[3];
+        GGML_ASSERT(ggml_nelements(cells) == int64_t(n_kv_max)*int64_t(n_lists));
+
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+        CUDA_CHECK(cudaMemcpyAsync(KV_max.ptr, cells->data, ggml_nbytes(cells), cudaMemcpyDeviceToDevice, main_stream));
+        ggml_cuda_flash_attn_cells_count(KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, n_lists, n_kv_max, main_stream);
+    } else if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
@@ -1105,7 +1121,7 @@ void launch_fattn(
     // with the index lists known, a quantized K or V needs f16 copies of the rows they name only; the lists of a large
     // batch overlap, so converting them one by one only pays while they name fewer rows than half the cache
     const bool sparse_rows = use_sparse && size_t(n_kv_max)*n_lists < size_t(K->ne[1])/2 &&
-        (K->ne[3] == 1 || K->ne[3] == mask->ne[3]) && (V->ne[3] == 1 || V->ne[3] == mask->ne[3]);
+        (K->ne[3] == 1 || K->ne[3] == n_seq_lists) && (V->ne[3] == 1 || V->ne[3] == n_seq_lists);
     const int32_t * sparse_indices = sparse_rows ? KV_max.ptr : nullptr;
     const int32_t * sparse_counts  = sparse_rows ? KV_max.ptr + size_t(n_kv_max)*n_lists : nullptr;
 
@@ -1330,7 +1346,7 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, n_seq_lists,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
