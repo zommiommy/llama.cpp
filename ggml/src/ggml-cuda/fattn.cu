@@ -314,6 +314,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    if constexpr (DKQ == 256 && DV == 256) {
+        // the cell list of a query is gathered once per tile: one tile of 16 columns holds the query heads of a KV head up
+        // to 16, where tiles of 8 gather it twice for a gqa ratio above 8
+        if (dst->op == GGML_OP_FLASH_ATTN_CELLS && use_gqa_opt && gqa_ratio > 8 && gqa_ratio <= 16) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
+            return;
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
