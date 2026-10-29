@@ -383,6 +383,9 @@ llama_model_qwen4exp::graph::build_hc_mix(
         if (w_inject != nullptr && w_inject->type == w_down->type &&
                 (w_down->type == GGML_TYPE_BF16 || w_down->type == GGML_TYPE_F16) && nt >= hc_cast_min_tokens) {
             xn_mm = ggml_cast(ctx0, xn, w_down->type);
+            // in the graph right after the norm, so a backend can write the cast with it (CUDA fuses rms_norm, mul, reshape,
+            // cpy); the gated mix would otherwise put its own view of xn in between
+            ggml_build_forward_expand(gf, xn_mm);
         }
         lo = ggml_scale(ctx0, build_lora_mm(w_down, xn_mm), 1.0f / (float) hc);
     }
