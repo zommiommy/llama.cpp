@@ -4377,6 +4377,36 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    // rms_norm * w with a BF16 cast of the product through a reshape (qwen4exp hc_mix): the norm kernel writes the cast
+    // too; the product and its reshape stay outputs, the gated mix reads them as well
+    std::initializer_list<enum ggml_op> rms_norm_mul_cast_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_CPY };
+
+    if (is_equal(rms_norm_mul_cast_ops, ops) &&
+            ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1, node_idx + 2, node_idx + 3 })) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * reshape  = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * cast     = cgraph->nodes[node_idx + 3];
+
+        if (mul->src[0] == rms_norm && reshape->src[0] == mul && cast->src[0] == reshape &&
+            rms_norm->src[0]->type == GGML_TYPE_F32 && rms_norm->src[0]->nb[0] == sizeof(float) &&
+            mul->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(mul->src[1]) &&
+            mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
+            cast->type == GGML_TYPE_BF16 && ggml_is_contiguous(cast) && ggml_nelements(cast) == ggml_nelements(mul)) {
+            // the cast writes its own buffer, which is its src[1]: it is checked against what the kernel reads apart
+            const auto disjoint = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data;
+                const char * b0 = (const char *) b->data;
+                return a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a) <= b0 ||
+                       b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b) <= a0;
+            };
+            int out_nodes[] = { node_idx + 1, node_idx + 2 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 3, out_nodes, 2) &&
+                disjoint(cast, rms_norm->src[0]) && disjoint(cast, mul->src[1]) && disjoint(cast, mul);
+        }
+        return false;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -5301,6 +5331,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_CPY }, {})) {
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {

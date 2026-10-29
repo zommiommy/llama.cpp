@@ -4022,6 +4022,53 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL with a BF16 cast of the product through a reshape, the product used too (qwen4exp hc_mix)
+struct test_rms_norm_mul_cast : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_CAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_rms_norm_mul_cast(std::array<int64_t, 4> ne = {256, 4, 7, 1}, float eps = 1e-6f)
+        : ne(ne), eps(eps) {}
+
+    // the norms of two backends can round a product to neighbouring BF16 values
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        // use a and w early, so no OP_NONE ends up between the fused nodes
+        a = ggml_add(ctx, a, w);
+
+        ggml_tensor * mul  = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, mul, ne[0]*ne[1], ne[2]*ne[3]);
+        ggml_tensor * cast = ggml_cast(ctx, flat, GGML_TYPE_BF16);
+
+        // the cast is reached first, so it follows the product as in the model, where the reshape has a user of its own
+        ggml_tensor * out = ggml_add(ctx, ggml_cast(ctx, cast, GGML_TYPE_F32), flat);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -11138,6 +11185,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+
+    // 130 columns take the kernel without float4 loads
+    for (const std::array<int64_t, 4> & ne : std::initializer_list<std::array<int64_t, 4>>{ {256, 4, 7, 1}, {2560, 4, 33, 1}, {130, 4, 7, 1} }) {
+        test_cases.emplace_back(new test_rms_norm_mul_cast(ne));
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
