@@ -342,7 +342,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
+    // the down and inject projections read xn in the type of their weights: a backend converts the activations of
+    // each such matmul on its own, so a batch large enough to run them as GEMMs converts [hc*n_embd, T] floats once
+    // for both, as each would; smaller batches keep the matrix-vector kernels that read F32
+    constexpr int64_t hc_cast_min_tokens = 32;
+    ggml_tensor * xn_mm = xn;
+    if (w_inject != nullptr && inject != nullptr && w_inject->type == w_down->type &&
+            (w_down->type == GGML_TYPE_BF16 || w_down->type == GGML_TYPE_F16) && nt >= hc_cast_min_tokens) {
+        xn_mm = ggml_cast(ctx0, xn, w_down->type);
+    }
+
+    ggml_tensor * lo = build_lora_mm(w_down, xn_mm);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
@@ -373,7 +383,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
+        *inject = build_lora_mm(w_inject, xn_mm);
         cb(*inject, "hc_inject", il);
     }
 
