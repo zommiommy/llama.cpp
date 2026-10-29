@@ -372,6 +372,9 @@ static char * moe_cache_xchg_base(const ggml_tensor * dst, const int i) {
 }
 
 void ggml_cuda_moe_cache_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // the copies of a prefetch read the copy list this lookup overwrites, and its experts read the prefetched slots
+    ggml_cuda_moe_cache_prefetch_join(ctx);
+
     const ggml_tensor * ids      = dst->src[0];
     ggml_tensor       * slot_map = dst->src[1];
     ggml_tensor       * state    = dst->src[2];
@@ -431,6 +434,277 @@ void ggml_cuda_moe_cache_join(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         (float *) dst->data, (int) dst->ne[0], (const int32_t *) state->data, skip_off,
         cpu_max > 0 ? moe_cache_xchg_base(dst, 1) : nullptr, max_pairs);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// a warp of the prefetch plan holds the logits of a token in registers, this many per lane: up to 1024 experts
+#define MOE_CACHE_PREFETCH_PER_LANE 32
+
+// one block: ranks the experts of each token by the router logits, then takes a victim for each of the first max_copies of them
+// that miss the cache, by rank (the first expert of every token, then the second, ...), as moe_cache_plan does for a lookup, but
+// spares the victims in keep and those holding an expert in the first n_rank of a token; updates the slot map, the slot owners
+// and the log, and leaves the copies for moe_cache_prefetch_copy in the state
+static __global__ void moe_cache_prefetch_plan(
+        const float * __restrict__ logits, const int n_rank, const int n_tokens,
+        const int32_t * __restrict__ keep, const int n_keep,
+        int32_t * __restrict__ slot_map, int32_t * __restrict__ state, int32_t * __restrict__ log,
+        const int il, const int n_expert, const int n_slots, const int max_copies) {
+    extern __shared__ uint32_t smem[];
+    const int n_cand = n_rank*n_tokens;
+    const int nw     = (n_expert + 31) / 32;
+    const int ns     = (n_slots + 31) / 32;
+    uint32_t * want   = smem;                             // experts ranked
+    uint32_t * listed = smem + nw;                        // missing experts taken
+    uint32_t * kept   = smem + 2*nw;                      // slots of keep
+    int32_t  * miss_r = (int32_t *) (smem + 2*nw + ns);   // the experts by rank, then token; -1 where the expert is cached
+    int32_t  * miss_e = miss_r + n_cand;                  // the missing experts taken
+    int32_t  * miss_s = miss_e + max_copies;              // the victim of each one copied
+
+    __shared__ int n_copies;
+
+    int32_t * owner   = state + MOE_CACHE_HEADER;
+    int32_t * victims = owner + n_slots;
+    int32_t * copies  = victims + n_slots;
+    int32_t * row     = slot_map + (int64_t) il*n_expert;
+
+    for (int i = threadIdx.x; i < 2*nw + ns; i += blockDim.x) {
+        smem[i] = 0;
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n_keep; i += blockDim.x) {
+        const int s = keep[i];
+        atomicOr(&kept[s / 32], 1u << (s % 32));
+    }
+    // a warp ranks a token from its logits in registers: each round takes the largest logit after the last one taken, ties by
+    // index; the padding is NaN, which no round takes
+    const int lane = threadIdx.x % WARP_SIZE;
+    for (int t = threadIdx.x / WARP_SIZE; t < n_tokens; t += blockDim.x / WARP_SIZE) {
+        const float * lt = logits + (int64_t) t*n_expert;
+        float lv[MOE_CACHE_PREFETCH_PER_LANE];
+#pragma unroll
+        for (int k = 0; k < MOE_CACHE_PREFETCH_PER_LANE; ++k) {
+            const int e = k*WARP_SIZE + lane;
+            lv[k] = e < n_expert ? lt[e] : NAN;
+        }
+        float last_v = INFINITY;
+        int   last_e = -1;
+        for (int r = 0; r < n_rank; ++r) {
+            float best_v = -INFINITY;
+            int   best_e = -1;
+#pragma unroll
+            for (int k = 0; k < MOE_CACHE_PREFETCH_PER_LANE; ++k) {
+                const float v = lv[k];
+                const int   e = k*WARP_SIZE + lane;
+                if ((v < last_v || (v == last_v && e > last_e)) && (best_e < 0 || v > best_v)) {
+                    best_v = v;
+                    best_e = e;
+                }
+            }
+#pragma unroll
+            for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+                const float v = __shfl_xor_sync(0xffffffff, best_v, off);
+                const int   e = __shfl_xor_sync(0xffffffff, best_e, off);
+                if (e >= 0 && (best_e < 0 || v > best_v || (v == best_v && e < best_e))) {
+                    best_v = v;
+                    best_e = e;
+                }
+            }
+            if (lane == 0) {
+                miss_r[r*n_tokens + t] = best_e;
+            }
+            last_v = best_v;
+            last_e = best_e;
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
+        const int e = miss_r[i];
+        if (e >= 0) {
+            atomicOr(&want[e / 32], 1u << (e % 32));
+            miss_r[i] = row[e] < 0 ? e : -1;
+        }
+    }
+    __syncthreads();
+
+    // each pick depends on the last, so one thread takes the missing experts best rank first, then walks the victim list once
+    // at most: the experts left without a victim are not copied
+    if (threadIdx.x == 0) {
+        int n_miss = 0;
+        for (int i = 0; i < n_cand && n_miss < max_copies; ++i) {
+            const int e = miss_r[i];
+            if (e >= 0 && !(listed[e / 32] & (1u << (e % 32)))) {
+                listed[e / 32] |= 1u << (e % 32);
+                miss_e[n_miss++] = e;
+            }
+        }
+        const int nv  = state[MOE_CACHE_N_VICTIMS];
+        int       cur = state[MOE_CACHE_CURSOR];
+        int       n   = 0;
+        for (int tries = 0; n < n_miss && tries < nv; ++tries) {
+            const int v = victims[cur];
+            cur = cur + 1 < nv ? cur + 1 : 0;
+            if (kept[v / 32] & (1u << (v % 32))) {
+                continue;
+            }
+            const int key = owner[v];
+            if (key >= 0 && key / n_expert == il) {
+                const int e = key % n_expert;
+                if (want[e / 32] & (1u << (e % 32))) {
+                    continue;
+                }
+            }
+            miss_s[n++] = v;
+        }
+        state[MOE_CACHE_CURSOR]   = cur;
+        state[MOE_CACHE_N_COPIES] = n;
+        n_copies = n;
+    }
+    __syncthreads();
+
+    const int log_cap = log[1];
+    for (int j = threadIdx.x; j < n_copies; j += blockDim.x) {
+        const int e   = miss_e[j];
+        const int v   = miss_s[j];
+        const int old = owner[v];
+        if (old >= 0) {
+            slot_map[old] = -1;
+        }
+        owner[v] = il*n_expert + e;
+        row[e]   = v;
+        copies[2*j + 0] = v;
+        copies[2*j + 1] = e;
+        moe_cache_log(log, log_cap, il | GGML_MOE_CACHE_LOG_PREFETCH, v, e);
+    }
+}
+
+// the copies of a prefetch run beside the compute kernels: a block per chunk, as moe_cache_copy launches for a lookup that
+// waits for its copies, holds most of the SMs while it waits for the link and made the expert matmuls it overlapped 2.75x as
+// slow; 8 blocks with 4 loads in flight per thread slow them by a tenth, and decode as fast as 4 blocks, while 2 gain half as much
+#define MOE_CACHE_PREFETCH_BLOCKS 8
+#define MOE_CACHE_PREFETCH_UNROLL 4
+
+static __global__ void moe_cache_prefetch_copy(const int32_t * __restrict__ state, const int n_slots, const moe_cache_banks banks,
+        const int n_banks) {
+    const int32_t * copies = state + MOE_CACHE_HEADER + 2*n_slots;
+    const int       n      = state[MOE_CACHE_N_COPIES];
+    const int64_t   tid    = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t   stride = (int64_t) gridDim.x*blockDim.x;
+    for (int j = 0; j < n; ++j) {
+        const int v = copies[2*j + 0];
+        const int e = copies[2*j + 1];
+        for (int b = 0; b < n_banks; ++b) {
+            const int64_t size = banks.size[b];
+            const char  * src  = banks.host[b] + (int64_t) e*size;
+            char        * dst  = banks.bank[b] + (int64_t) v*size;
+            if ((((uintptr_t) src | (uintptr_t) dst | (uintptr_t) size) & 15) != 0) {
+                for (int64_t i = tid; i < size; i += stride) {
+                    dst[i] = src[i];
+                }
+                continue;
+            }
+            const uint4 * s   = (const uint4 *) src;
+            uint4       * d   = (uint4 *) dst;
+            const int64_t n16 = size/16;
+            int64_t i = tid;
+            for (; i + (MOE_CACHE_PREFETCH_UNROLL - 1)*stride < n16; i += MOE_CACHE_PREFETCH_UNROLL*stride) {
+                uint4 w[MOE_CACHE_PREFETCH_UNROLL];
+#pragma unroll
+                for (int u = 0; u < MOE_CACHE_PREFETCH_UNROLL; ++u) {
+                    w[u] = s[i + u*stride];
+                }
+#pragma unroll
+                for (int u = 0; u < MOE_CACHE_PREFETCH_UNROLL; ++u) {
+                    d[i + u*stride] = w[u];
+                }
+            }
+            for (; i < n16; i += stride) {
+                d[i] = s[i];
+            }
+        }
+    }
+}
+
+bool ggml_cuda_moe_cache_prefetch_supported(const ggml_tensor * dst) {
+    const int n_banks = ggml_get_op_params_i32(dst, 1);
+    if (n_banks < 1 || n_banks > 3) {
+        return false;
+    }
+    if (dst->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (int i : { 2, 3, 4 }) {
+        if (dst->src[i]->type != GGML_TYPE_I32) {
+            return false;
+        }
+    }
+    // the planner keeps the ranked experts and the slot bitmap in shared memory
+    const int64_t n_cand   = ggml_get_op_params_i32(dst, 10)*dst->src[0]->ne[1];
+    const int64_t n_expert = dst->src[2]->ne[0];
+    const int64_t n_slots  = dst->src[5]->ne[2] - 1;
+    return n_cand <= 4096 && n_expert <= MOE_CACHE_PREFETCH_PER_LANE*WARP_SIZE && n_slots <= 65536;
+}
+
+void ggml_cuda_moe_cache_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * logits   = dst->src[0];
+    const ggml_tensor * after    = dst->src[1];
+    ggml_tensor       * slot_map = dst->src[2];
+    ggml_tensor       * state    = dst->src[3];
+    ggml_tensor       * log      = dst->src[4];
+
+    const int  il        = ggml_get_op_params_i32(dst, 0);
+    const int  n_banks   = ggml_get_op_params_i32(dst, 1);
+    const bool keep      = ggml_get_op_params_i32(dst, 8) != 0;
+    const int  n_copies  = ggml_get_op_params_i32(dst, 9);
+    const int  n_rank    = ggml_get_op_params_i32(dst, 10);
+
+    const int n_tokens = (int) logits->ne[1];
+    const int n_expert = (int) slot_map->ne[0];
+    const int n_slots  = (int) dst->src[5]->ne[2] - 1;
+
+    moe_cache_banks banks = {};
+    for (int b = 0; b < n_banks; ++b) {
+        const ggml_tensor * bank = dst->src[5 + b];
+        banks.host[b] = moe_cache_xchg_base(dst, 2 + 2*b);
+        banks.bank[b] = (char *) bank->data;
+        banks.size[b] = bank->nb[2];
+    }
+
+    // the copies of an earlier prefetch may still read the copy list
+    ggml_cuda_moe_cache_prefetch_join(ctx);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int    nw   = (n_expert + 31) / 32;
+    const int    ns   = (n_slots + 31) / 32;
+    const size_t smem = (2*nw + ns)*sizeof(uint32_t) + (n_rank*n_tokens + 2*n_copies)*sizeof(int32_t);
+    moe_cache_prefetch_plan<<<1, MOE_CACHE_PLAN_THREADS, smem, stream>>>(
+        (const float *) logits->data, n_rank, n_tokens,
+        keep ? (const int32_t *) after->data : nullptr, keep ? (int) ggml_nelements(after) : 0,
+        (int32_t *) slot_map->data, (int32_t *) state->data, (int32_t *) log->data, il, n_expert, n_slots, n_copies);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (ctx.moe_prefetch_fork == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_prefetch_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_prefetch_done, cudaEventDisableTiming));
+    }
+    cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
+    CUDA_CHECK(cudaEventRecord(ctx.moe_prefetch_fork, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(side, ctx.moe_prefetch_fork, 0));
+
+    moe_cache_prefetch_copy<<<MOE_CACHE_PREFETCH_BLOCKS, MOE_CACHE_COPY_THREADS, 0, side>>>(
+        (const int32_t *) state->data, n_slots, banks, n_banks);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaEventRecord(ctx.moe_prefetch_done, side));
+    ctx.moe_prefetch_pending = true;
+}
+
+void ggml_cuda_moe_cache_prefetch_join(ggml_backend_cuda_context & ctx) {
+    if (ctx.moe_prefetch_pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.moe_prefetch_done, 0));
+        ctx.moe_prefetch_pending = false;
+    }
 }
 
 // the ranges of one launch, passed as kernel parameters; first_chunk is the prefix sum of their chunks

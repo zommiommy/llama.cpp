@@ -427,6 +427,7 @@ struct llama_moe_cache::impl {
         moe_cache_slru slru;
         ggml_tensor * dstate = nullptr; // I32, the state of ggml_moe_cache_fill on the device, a view of dfill
         size_t state_off = 0;           // its first element in dfill
+        std::vector<uint8_t> prefetched; // [n_slots] the slot holds a prefetched expert no lookup found yet
     };
 
     struct layer {
@@ -434,6 +435,8 @@ struct llama_moe_cache::impl {
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
         bool cpu = false;                   // the host can compute its experts: plain SwiGLU of separate gate, up and down
+        ggml_tensor * router   = nullptr;   // the router weights and bias of a prefetch, when ranking the logits selects the experts
+        ggml_tensor * router_b = nullptr;
     };
 
     struct binding {
@@ -463,6 +466,7 @@ struct llama_moe_cache::impl {
 
     int32_t cpu_experts; // missing experts of a layer of a small batch the host may compute, 0 for none
     int32_t tail_skip;   // a missing expert no token of a small batch selects at a rank below this is skipped, 0 for none
+    int32_t prefetch;    // missing experts of the next layer a lookup of a small batch copies at most, 0 for none
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -471,6 +475,7 @@ struct llama_moe_cache::impl {
     stats stats_ring;  // experts uploaded to the ring
     stats stats_cpu;   // missing experts of small batches the host computed
     stats stats_skip;  // missing experts of small batches skipped at the tail of the routes
+    stats stats_prefetch; // experts of small batches prefetched, the hits are those a lookup found
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -518,8 +523,9 @@ struct llama_moe_cache::impl {
     int64_t ring_n_outputs = 0; // the output rows of the current ubatch
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
-            size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip) :
+            size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip, int32_t prefetch) :
             n_expert_used(model.hparams.n_expert_used_max()), free_target(free), cpu_experts(cpu_experts), tail_skip(tail_skip),
+            prefetch(prefetch),
             layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -665,6 +671,7 @@ struct llama_moe_cache::impl {
             // an elastic group starts with the slots of the largest small batch and grows into free memory
             g.n_min = (int32_t) std::min<int64_t>(g.n_slots, std::min<int64_t>(max_batch*n_expert_used, n_expert));
             g.slru.init(model.layers.size(), n_expert, g.n_slots, d.elastic ? g.n_min : g.n_slots);
+            g.prefetched.assign(g.n_slots, 0);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
         }
@@ -711,6 +718,14 @@ struct llama_moe_cache::impl {
                 layer & l = layers[il];
                 l.ig      = (int32_t) ig;
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
+                // a prefetch ranks the experts by the router logits: not for a selection with a bias on the probabilities or with
+                // expert groups, nor for the nextn layers generation skips
+                const llama_layer & ml = model.layers[il];
+                if (ml.ffn_gate_inp != nullptr && ml.ffn_exp_probs_b == nullptr && model.hparams.n_expert_groups <= 1 &&
+                        ml.ffn_gate_inp->ne[1] == g.ref[0]->ne[2] && (uint32_t) il < model.hparams.n_layer()) {
+                    l.router   = ml.ffn_gate_inp;
+                    l.router_b = ml.ffn_gate_inp_b;
+                }
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
@@ -1027,9 +1042,10 @@ struct llama_moe_cache::impl {
             return;
         }
 
-        // each record is a distinct expert of a layer of a batch, twice as many as a batch can need
+        // each record is a distinct expert of a layer of a batch, twice as many as a batch can need; a prefetch adds as many
+        // records as the lookup of its layer at most
         const int64_t n_ids   = max_batch*n_expert_used;
-        const int64_t log_cap = 2*(int64_t) layers.size()*n_ids;
+        const int64_t log_cap = (prefetch > 0 ? 4 : 2)*(int64_t) layers.size()*n_ids;
 
         // the slot maps, the state of each group and the log in one tensor, so that the host writes its part in one copy
         const size_t pad = 64;
@@ -1414,11 +1430,17 @@ struct llama_moe_cache::impl {
         }
         // the log is emptied by the next push, a replay before it skips the records already replayed
         for (int32_t k = d.log_done; k < n; ++k) {
-            const int32_t il = log_records[4 + 3*k + 0];
-            const int32_t s  = log_records[4 + 3*k + 1];
-            const int32_t x  = log_records[4 + 3*k + 2];
+            const int32_t tag = log_records[4 + 3*k + 0];
+            const int32_t il  = tag & ~GGML_MOE_CACHE_LOG_PREFETCH;
+            const int32_t s   = log_records[4 + 3*k + 1];
+            const int32_t x   = log_records[4 + 3*k + 2];
             group & g = groups[layers[il].ig];
-            if (s == -2) {
+            if (tag & GGML_MOE_CACHE_LOG_PREFETCH) {
+                g.slru.filled(il, x, s);
+                g.prefetched[s] = 1;
+                stats_prefetch.misses++;
+                stats_prefetch.bytes += g.slot_bytes;
+            } else if (s == -2) {
                 stats_skip.misses++;
                 stats_skip.bytes += g.slot_bytes;
             } else if (s < 0) {
@@ -1426,11 +1448,16 @@ struct llama_moe_cache::impl {
                 stats_cpu.bytes += g.slot_bytes;
             } else if (x >= 0) {
                 g.slru.filled(il, x, s);
+                g.prefetched[s] = 0;
                 stats_fill.misses++;
                 stats_fill.bytes += g.slot_bytes;
             } else {
                 if (g.slru.key_of[s] == il*g.slru.n_expert + (-1 - x)) {
                     g.slru.touch(s);
+                    if (g.prefetched[s]) {
+                        g.prefetched[s] = 0;
+                        stats_prefetch.hits++;
+                    }
                 }
                 stats_fill.hits++;
             }
@@ -1508,6 +1535,43 @@ struct llama_moe_cache::impl {
             return experts;
         }
         return ggml_moe_cache_join(ctx, experts, fill);
+    }
+
+    // the router of layer il + 1 if the lookup of layer il for n_tokens tokens can prefetch its experts: both layers are looked
+    // up on the same device, which then joins the copies before the next lookup, and the router ranks every expert of its slot map
+    ggml_tensor * get_prefetch_router(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+        if (prefetch == 0 || il < 0 || il + 1 >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il + 1].router == nullptr) {
+            return nullptr;
+        }
+        const group & g = groups[layers[il + 1].ig];
+        const device & d = devices[g.id];
+        if (g.id != groups[layers[il].ig].id || !d.fill || g.dstate == nullptr || layers[il + 1].router->ne[1] != d.dmap->ne[0] ||
+                get_slot_map(il + 1, n_tokens, n_expert_used) == nullptr) {
+            return nullptr;
+        }
+        return layers[il + 1].router;
+    }
+
+    // the prefetch of up to prefetch experts of layer il + 1, those the router logits [n_expert, n_tokens] rank highest in their
+    // tokens first, after fill, the lookup of layer il
+    ggml_tensor * build_prefetch(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * fill, int32_t il) const {
+        const layer & l = layers[il + 1];
+        const group & g = groups[l.ig];
+        const device & d = devices[g.id];
+        if (l.router_b != nullptr) {
+            logits = ggml_add(ctx, logits, l.router_b);
+        }
+        // the device ranks each token's expected selection; the copies fit the copy list of a lookup, which holds a selection
+        const int n_copies = (int) std::min<int64_t>(prefetch, ggml_nelements(fill));
+        ggml_tensor * banks[3];
+        const void  * host[3];
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            banks[ip] = g.banks[ip];
+            host[ip]  = l.experts[ip]->data;
+        }
+        // layers of the same group share the banks: the slots the lookup of layer il hands its experts are spared
+        return ggml_moe_cache_prefetch(ctx, logits, fill, d.dmap, g.dstate, d.dlog, banks, host, (int) l.experts.size(), il + 1,
+            layers[il].ig == l.ig, (int) fill->ne[0], n_copies);
     }
 
     // device memory of an expert tensor in a ring slot, with one more expert: CUDA MMQ can read past the last one
@@ -1921,6 +1985,10 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: small batches: %zu missing experts skipped at the tail of the routes, %.2f MiB not read\n",
                 stats_skip.misses, stats_skip.bytes/1024.0/1024.0);
         }
+        if (stats_prefetch.misses > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: small batches: %zu experts prefetched for the next layer, %.2f MiB, %.1f%% of them found by a lookup\n",
+                stats_prefetch.misses, stats_prefetch.bytes/1024.0/1024.0, 100.0*stats_prefetch.hits/stats_prefetch.misses);
+        }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
@@ -1931,8 +1999,8 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
-        size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip) :
-    pimpl(new impl(model, backends, bufts, size, free, cpu_experts, tail_skip)) {
+        size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip, int32_t prefetch) :
+    pimpl(new impl(model, backends, bufts, size, free, cpu_experts, tail_skip, prefetch)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -1955,6 +2023,14 @@ ggml_tensor * llama_moe_cache::build_fill(ggml_context * ctx, ggml_tensor * ids,
 
 ggml_tensor * llama_moe_cache::build_join(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * fill) const {
     return pimpl->build_join(ctx, experts, fill);
+}
+
+ggml_tensor * llama_moe_cache::get_prefetch_router(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->get_prefetch_router(il, n_tokens, n_expert_used);
+}
+
+ggml_tensor * llama_moe_cache::build_prefetch(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * fill, int32_t il) const {
+    return pimpl->build_prefetch(ctx, logits, fill, il);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {

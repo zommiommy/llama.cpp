@@ -765,6 +765,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (moe_prefetch_fork != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(moe_prefetch_fork));
+    }
+    if (moe_prefetch_done != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(moe_prefetch_done));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -3334,6 +3340,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MOE_CACHE_JOIN:
             ggml_cuda_moe_cache_join(ctx, dst);
             break;
+        case GGML_OP_MOE_CACHE_PREFETCH:
+            ggml_cuda_moe_cache_prefetch(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5570,6 +5579,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            // a capture ends on the main stream only once the copies of a prefetch joined it, and the next part starts at the
+            // lookup that reads them
+            ggml_cuda_moe_cache_prefetch_join(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -6872,6 +6884,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_moe_cache_fill_supported(op);
         case GGML_OP_MOE_CACHE_JOIN:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32;
+        case GGML_OP_MOE_CACHE_PREFETCH:
+            return ggml_cuda_moe_cache_prefetch_supported(op);
 
         default:
             return false;

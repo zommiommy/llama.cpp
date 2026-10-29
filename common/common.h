@@ -601,6 +601,7 @@ struct common_params {
     size_t moe_cache_free = 0; // > 0: elastic MoE cache that keeps this many bytes of GPU memory free, moe_cache_size is its maximum
     int32_t moe_cpu_experts = 0; // > 0: the CPU computes up to this many experts of a MoE layer that miss the cache, in small batches
     int32_t moe_tail_skip   = 0; // > 0: a missing expert that no token of a small batch selects at a rank below this is skipped
+    int32_t moe_prefetch    = 0; // > 0: a MoE layer of a small batch copies up to this many missing experts of the next layer
     // per-layer KV cache overrides: "IL=TYPEK[/TYPEV][:wN]" entries, comma-separated (--cache-layer)
     std::string cache_layers;
 

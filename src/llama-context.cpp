@@ -393,6 +393,7 @@ llama_context::llama_context(
     cparams.moe_cache_free = params.moe_cache_free;
     cparams.moe_cpu_experts = params.moe_cpu_experts;
     cparams.moe_tail_skip   = params.moe_tail_skip;
+    cparams.moe_prefetch    = params.moe_prefetch;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -594,7 +595,7 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_free,
-                cparams.moe_cpu_experts, cparams.moe_tail_skip);
+                cparams.moe_cpu_experts, cparams.moe_tail_skip, cparams.moe_prefetch);
         }
 
         sched_reserve();
@@ -4118,6 +4119,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_free              =*/ 0,
         /*.moe_cpu_experts             =*/ 0,
         /*.moe_tail_skip               =*/ 0,
+        /*.moe_prefetch                =*/ 0,
         /*.cache_layers                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

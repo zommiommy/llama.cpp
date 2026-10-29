@@ -65,6 +65,7 @@ struct llama_cparams {
     size_t moe_cache_free;
     int32_t moe_cpu_experts;
     int32_t moe_tail_skip;
+    int32_t moe_prefetch;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

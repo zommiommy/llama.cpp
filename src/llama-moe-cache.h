@@ -16,8 +16,10 @@ public:
     // with free > 0 the cache is elastic: it holds memory only for its active slots, at most size, and adapt() keeps free bytes of each device free
     // cpu_experts > 0: the host computes up to that many missing experts of each layer of a small batch, beside the device
     // tail_skip > 0: a missing expert that no token of a small batch selects at a rank below tail_skip is skipped, its output is zero
+    // prefetch > 0: the lookup of a layer of a small batch copies up to prefetch missing experts of the next layer, those its
+    // router ranks highest first
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
-            size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip);
+            size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip, int32_t prefetch);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -35,6 +37,14 @@ public:
 
     // the outputs of the experts [n_embd, n_expert_used, n_tokens] with those the lookup fill left to the host or skipped
     ggml_tensor * build_join(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * fill) const;
+
+    // the router of layer il + 1 if the lookup of layer il for n_tokens tokens can prefetch its experts, nullptr otherwise: the
+    // next layer is looked up on the same device, and its experts are selected by ranking the logits of its router
+    ggml_tensor * get_prefetch_router(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // copies up to prefetch experts of layer il + 1 that the cache misses, those its router logits [n_expert, n_tokens], computed
+    // from the input of layer il, rank highest in their tokens first, while layer il computes; fill is the lookup of layer il
+    ggml_tensor * build_prefetch(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * fill, int32_t il) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;

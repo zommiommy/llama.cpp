@@ -2912,6 +2912,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_TAIL_SKIP"));
     add_opt(common_arg(
+        {"--moe-prefetch"}, "N",
+        "each MoE layer of a small batch applies the next layer's router to its own input and, while the layer computes, copies "
+        "up to N experts of the next layer that miss the MoE cache, those the router ranks highest in their tokens first. does "
+        "not change the output (default: 0, off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefetch = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

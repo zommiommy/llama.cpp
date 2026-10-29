@@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RANGE_MASK",
     "MOE_CACHE_FILL",
     "MOE_CACHE_JOIN",
+    "MOE_CACHE_PREFETCH",
 
     "UNARY",
 
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1222,6 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "range_mask(ranges)",
     "moe_cache_fill(ids, slot_map, state, log, banks, x)",
     "moe_cache_join(experts, state)",
+    "moe_cache_prefetch(logits, after, slot_map, state, log, banks)",
 
     "unary(x)",
 
@@ -1239,7 +1241,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6860,6 +6862,61 @@ struct ggml_tensor * ggml_moe_cache_join(
     result->src[0] = experts;
     result->src[1] = lookup;
     result->src[2] = lookup->src[2];
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cache_prefetch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * after,
+        struct ggml_tensor  * slot_map,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * log,
+        struct ggml_tensor ** banks,
+        const void         ** host,
+        int                   n_banks,
+        int                   il,
+        bool                  keep,
+        int                   n_rank,
+        int                   n_copies) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits) && logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(logits->ne[0] == slot_map->ne[0]);
+    GGML_ASSERT(after->op == GGML_OP_MOE_CACHE_FILL && n_rank > 0 && n_rank <= logits->ne[0] &&
+            n_rank*logits->ne[1] <= ggml_nelements(after));
+    GGML_ASSERT(n_copies >= 0 && n_copies <= ggml_nelements(after));
+    GGML_ASSERT(slot_map->type == GGML_TYPE_I32 && ggml_is_contiguous(slot_map));
+    GGML_ASSERT(state->type == GGML_TYPE_I32 && ggml_is_contiguous(state));
+    GGML_ASSERT(log->type == GGML_TYPE_I32 && ggml_is_contiguous(log) && ggml_nelements(log) >= 4);
+    GGML_ASSERT(n_banks >= 1 && n_banks <= 3);
+    GGML_ASSERT(il >= 0 && il < slot_map->ne[1]);
+
+    const int64_t n_slots = banks[0]->ne[2] - 1;
+    GGML_ASSERT(ggml_nelements(state) >= GGML_MOE_CACHE_STATE_SIZE(n_slots, ggml_nelements(after)));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    // il, n_banks, the host experts, keep, n_copies, n_rank
+    int32_t params[11] = { il, n_banks };
+    params[8]  = keep;
+    params[9]  = n_copies;
+    params[10] = n_rank;
+    for (int i = 0; i < n_banks; ++i) {
+        GGML_ASSERT(banks[i]->ne[2] == n_slots + 1 && ggml_is_contiguous(banks[i]));
+        const uint64_t p = (uint64_t) (uintptr_t) host[i];
+        memcpy(&params[2 + 2*i], &p, sizeof(p));
+    }
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_PREFETCH;
+    result->src[0] = logits;
+    result->src[1] = after;
+    result->src[2] = slot_map;
+    result->src[3] = state;
+    result->src[4] = log;
+    for (int i = 0; i < n_banks; ++i) {
+        result->src[5 + i] = banks[i];
+    }
 
     return result;
 }

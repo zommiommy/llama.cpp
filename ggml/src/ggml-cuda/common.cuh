@@ -1457,6 +1457,12 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // the copies of a MoE cache prefetch run on stream GGML_CUDA_MAX_STREAMS - 1 from the fork event; the main stream waits for
+    // the done event before the next lookup and before the graph ends
+    cudaEvent_t moe_prefetch_fork    = nullptr;
+    cudaEvent_t moe_prefetch_done    = nullptr;
+    bool        moe_prefetch_pending = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
