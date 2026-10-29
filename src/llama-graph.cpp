@@ -3459,8 +3459,12 @@ ggml_tensor * llm_graph_context::build_fused_top_k_mask(
     const int64_t m2 = kq_mask->ne[2];
     const int64_t m3 = kq_mask->ne[3];
 
+    // a tensor already in the row layout is used as is: a view of a host input made in every layer would be uploaded once per layer
     auto rows = [&](ggml_tensor * t) {
-        return t ? ggml_reshape_4d(ctx0, t, t->ne[0], m1, m2, m3) : nullptr;
+        if (t == nullptr || (t->ne[1] == m1 && t->ne[2] == m2 && t->ne[3] == m3)) {
+            return t;
+        }
+        return ggml_reshape_4d(ctx0, t, t->ne[0], m1, m2, m3);
     };
 
     ggml_tensor * cur = ggml_top_k_mask(ctx0, kq_mask, rows(top_k), rows(score), blocks, rows(extra));
