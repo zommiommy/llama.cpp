@@ -10,6 +10,9 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -898,12 +901,27 @@ void llama_prefetch(llama_memory_ranges mr) {
                 llama_format_win_err(GetLastError()).c_str());
     }
 #else
-    for (const auto & range : mr) {
-        // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
-        if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
-            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
-            return;
+    // a gather of scattered rows makes one call per row, tens of thousands for a prompt batch, which take hundreds of
+    // ms on one thread: large sets of ranges are split over threads, the readahead they start runs in the kernel
+    constexpr size_t n_ranges_per_thread = 2048;
+    const size_t n_threads = std::clamp<size_t>((mr.size() + n_ranges_per_thread - 1)/n_ranges_per_thread, 1, 16);
+    std::atomic<bool> failed = false;
+    auto advise = [&](size_t i0, size_t i1) {
+        for (size_t i = i0; i < i1 && !failed.load(std::memory_order_relaxed); ++i) {
+            // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
+            if (madvise(const_cast<void *>(mr[i].addr), mr[i].size, MADV_WILLNEED) != 0 && !failed.exchange(true)) {
+                LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
+            }
         }
+    };
+    const size_t chunk = (mr.size() + n_threads - 1)/n_threads;
+    std::vector<std::thread> workers;
+    for (size_t t = 1; t < n_threads; ++t) {
+        workers.emplace_back(advise, t*chunk, std::min(mr.size(), (t + 1)*chunk));
+    }
+    advise(0, std::min(mr.size(), chunk));
+    for (std::thread & w : workers) {
+        w.join();
     }
 #endif
 #else
