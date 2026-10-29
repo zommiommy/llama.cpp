@@ -432,3 +432,56 @@ void ggml_cuda_moe_cache_join(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         cpu_max > 0 ? moe_cache_xchg_base(dst, 1) : nullptr, max_pairs);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// the ranges of one launch, passed as kernel parameters; first_chunk is the prefix sum of their chunks
+#define MOE_CACHE_RANGES_MAX 128
+struct moe_cache_ranges {
+    const char * src[MOE_CACHE_RANGES_MAX];
+    char       * dst[MOE_CACHE_RANGES_MAX];
+    int64_t      size[MOE_CACHE_RANGES_MAX];
+    int32_t      first_chunk[MOE_CACHE_RANGES_MAX + 1];
+    int32_t      n;
+};
+
+// block: one chunk of one range
+static __global__ void moe_cache_copy_ranges(const moe_cache_ranges ranges) {
+    int r = 0;
+    while (r + 1 < ranges.n && ranges.first_chunk[r + 1] <= (int32_t) blockIdx.x) {
+        r++;
+    }
+    const int64_t size = ranges.size[r];
+    const int64_t i0   = (int64_t) (blockIdx.x - ranges.first_chunk[r])*MOE_CACHE_COPY_CHUNK;
+    const int64_t i1   = min(i0 + MOE_CACHE_COPY_CHUNK, size);
+
+    const char * src = ranges.src[r];
+    char       * dst = ranges.dst[r];
+
+    if ((((uintptr_t) src | (uintptr_t) dst | (uintptr_t) size) & 15) == 0) {
+        for (int64_t i = i0 + 16*threadIdx.x; i < i1; i += 16*blockDim.x) {
+            *(uint4 *) (dst + i) = *(const uint4 *) (src + i);
+        }
+    } else {
+        for (int64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+void ggml_cuda_moe_cache_copy_ranges(cudaStream_t stream, const void * const * src, void * const * dst, const size_t * size, int n) {
+    for (int i0 = 0; i0 < n; i0 += MOE_CACHE_RANGES_MAX) {
+        moe_cache_ranges ranges;
+        ranges.n = 0;
+        ranges.first_chunk[0] = 0;
+        for (int i = i0; i < n && ranges.n < MOE_CACHE_RANGES_MAX; ++i) {
+            const int r = ranges.n++;
+            ranges.src[r]  = (const char *) src[i];
+            ranges.dst[r]  = (char *) dst[i];
+            ranges.size[r] = (int64_t) size[i];
+            ranges.first_chunk[r + 1] = ranges.first_chunk[r] + (int32_t) ((size[i] + MOE_CACHE_COPY_CHUNK - 1)/MOE_CACHE_COPY_CHUNK);
+        }
+        if (ranges.first_chunk[ranges.n] > 0) {
+            moe_cache_copy_ranges<<<ranges.first_chunk[ranges.n], MOE_CACHE_COPY_THREADS, 0, stream>>>(ranges);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+}

@@ -355,6 +355,31 @@ struct llama_moe_cache::impl {
         }
     };
 
+    // copies of many device ranges in a few launches, by the backend's ggml_backend_copy_ranges_async where it has one:
+    // a copy per run of experts leaves the stream idle between thousands of them per prompt
+    struct range_copies {
+        using fn_t = void (*)(ggml_backend_t, const void * const *, void * const *, const size_t *, int);
+        fn_t fn = nullptr;
+        std::vector<const void *> src;
+        std::vector<void *>       dst;
+        std::vector<size_t>       size;
+
+        void add(const void * s, void * d, size_t n) {
+            src.push_back(s);
+            dst.push_back(d);
+            size.push_back(n);
+        }
+
+        void flush(ggml_backend_t backend) {
+            if (!src.empty()) {
+                fn(backend, src.data(), dst.data(), size.data(), (int) src.size());
+                src.clear();
+                dst.clear();
+                size.clear();
+            }
+        }
+    };
+
     // a GPU with its own budget and banks, it caches the layers assigned to it
     struct device {
         ggml_backend_t backend;
@@ -362,6 +387,7 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
         bool elastic = false;  // the banks are demand-paged and only their active slots hold memory
+        range_copies copies;
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -497,6 +523,8 @@ struct llama_moe_cache::impl {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                d.copies.fn = (range_copies::fn_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(d.backend)), "ggml_backend_copy_ranges_async");
                 if (free_target > 0) {
                     // demand paging lets the banks reserve the whole budget and hold memory for the active slots only;
                     // a prompt moves GBs of them, and the driver commits and releases memory per page: 2 MiB pages
@@ -840,6 +868,7 @@ struct llama_moe_cache::impl {
             }
         }
         ggml_backend_t backend = devices[g.id].backend;
+        range_copies & copies  = devices[g.id].copies;
         size_t i = 0;
         for (int32_t s = n_new; s < r.n_active; ++s) {
             if (out[s] || r.key_of[s] < 0) {
@@ -850,6 +879,10 @@ struct llama_moe_cache::impl {
             }
             const int32_t d = next_out[i++];
             for (ggml_tensor * bank : g.banks) {
+                if (copies.fn != nullptr) {
+                    copies.add((const char *) bank->data + s*bank->nb[2], (char *) bank->data + d*bank->nb[2], bank->nb[2]);
+                    continue;
+                }
                 ggml_reset(ctx_views.get());
                 ggml_tensor * src = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], 1, bank->nb[1], bank->nb[2], s*bank->nb[2]);
                 ggml_tensor * dst = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], 1, bank->nb[1], bank->nb[2], d*bank->nb[2]);
@@ -859,6 +892,7 @@ struct llama_moe_cache::impl {
             }
             r.relocate(s, d);
         }
+        copies.flush(backend);
     }
 
     // grow or shrink the elastic groups so that each device keeps about free_target bytes free
@@ -1568,6 +1602,7 @@ struct llama_moe_cache::impl {
         const group & g = groups[l.ig];
         const int32_t * slots = g.slru.slot_map[il];
         char * base = (char *) ggml_backend_buffer_get_base(r.buf.get()) + s*r.slot_bytes;
+        range_copies & copies = devices[g.id].copies;
         for (const bool from_cache : { false, true }) {
             size_t off = 0;
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -1581,6 +1616,14 @@ struct llama_moe_cache::impl {
                         n++;
                     }
                     if (cached == from_cache) {
+                        if (cached && copies.fn != nullptr) {
+                            const ggml_tensor * bank = g.banks[ip];
+                            copies.add((const char *) bank->data + slots[e]*bank->nb[2], base + off + e*nb2, n*nb2);
+                            stats_copy.hits  += n;
+                            stats_copy.bytes += n*nb2;
+                            e += n;
+                            continue;
+                        }
                         ggml_reset(ctx_views.get());
                         ggml_tensor * dst = ggml_new_tensor_3d(ctx_views.get(), w->type, w->ne[0], w->ne[1], n);
                         ggml_backend_tensor_alloc(r.buf.get(), dst, base + off + e*nb2);
@@ -1602,6 +1645,7 @@ struct llama_moe_cache::impl {
                 off += ring_tensor_bytes(w);
             }
         }
+        copies.flush(r.copy);
         ggml_backend_event_record(r.filled[s], r.copy);
         r.layer[s] = il;
     }
