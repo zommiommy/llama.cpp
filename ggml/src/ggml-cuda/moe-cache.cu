@@ -53,6 +53,11 @@ static __device__ __forceinline__ void moe_cache_log(int32_t * log, const int lo
     }
 }
 
+// shared memory of a lookup planner: five bitmaps of the experts, three lists as long as the selection and five counters
+static size_t moe_cache_plan_smem(const int64_t n_expert, const int64_t n_ids) {
+    return (5*((n_expert + 31)/32) + 3*n_ids + 5)*sizeof(int32_t);
+}
+
 // one block: finds the selected experts in the slot map; skips the missing experts no token selects at a rank below skip_rank;
 // leaves up to cpu_max of the other missing experts to the host and posts their pairs and inputs to xchg; takes a victim for
 // each other missing expert, updates the slot map, the slot owners and the log, and leaves the copies for moe_cache_copy in the
@@ -74,11 +79,12 @@ static __global__ void moe_cache_plan(
     int32_t  * miss_s = miss_e + n_ids;  // the best rank of each missing expert, then the victim of each one copied
     int32_t  * pair_i = miss_s + n_ids;  // selection index of each pair left to the host
 
-    __shared__ int n_miss;
-    __shared__ int n_rest; // missing experts not skipped, moved to the front of miss_e
-    __shared__ int n_cpu;
-    __shared__ int n_pairs;
-    __shared__ int n_skip;
+    // the counters follow the lists: the launch needs no static shared memory, see moe_cache_plan_smem
+    int & n_miss  = pair_i[n_ids + 0];
+    int & n_rest  = pair_i[n_ids + 1]; // missing experts not skipped, moved to the front of miss_e
+    int & n_cpu   = pair_i[n_ids + 2];
+    int & n_pairs = pair_i[n_ids + 3];
+    int & n_skip  = pair_i[n_ids + 4];
 
     int32_t * owner   = state + MOE_CACHE_HEADER;
     int32_t * victims = owner + n_slots;
@@ -349,7 +355,7 @@ static __global__ void moe_cache_join(
     }
 }
 
-bool ggml_cuda_moe_cache_fill_supported(const ggml_tensor * dst) {
+bool ggml_cuda_moe_cache_fill_supported(const ggml_tensor * dst, const int device) {
     const int n_banks = ggml_get_op_params_i32(dst, 1);
     if (n_banks < 1 || n_banks > 3) {
         return false;
@@ -359,10 +365,10 @@ bool ggml_cuda_moe_cache_fill_supported(const ggml_tensor * dst) {
             return false;
         }
     }
-    // the planner keeps the batch in shared memory
+    // the planner keeps the batch in shared memory, and the join a position per selected expert
     const int64_t n_ids    = ggml_nelements(dst->src[0]);
     const int64_t n_expert = dst->src[1]->ne[0];
-    return n_ids <= 4096 && n_expert <= 65536;
+    return n_ids <= 4096 && n_expert <= 65536 && moe_cache_plan_smem(n_expert, n_ids) <= ggml_cuda_info().devices[device].smpb;
 }
 
 static char * moe_cache_xchg_base(const ggml_tensor * dst, const int i) {
@@ -407,8 +413,7 @@ void ggml_cuda_moe_cache_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     cudaStream_t stream = ctx.stream();
 
-    const int    nw   = (n_expert + 31) / 32;
-    const size_t smem = 5*nw*sizeof(uint32_t) + 3*n_ids*sizeof(int32_t);
+    const size_t smem = moe_cache_plan_smem(n_expert, n_ids);
     moe_cache_plan<<<1, MOE_CACHE_PLAN_THREADS, smem, stream>>>(
         (const int32_t *) ids->data, n_ids, n_used, x != nullptr ? (const float *) x->data : nullptr, n_embd,
         (int32_t *) slot_map->data, (int32_t *) state->data, (int32_t *) log->data,
@@ -439,6 +444,12 @@ void ggml_cuda_moe_cache_join(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 // a warp of the prefetch plan holds the logits of a token in registers, this many per lane: up to 1024 experts
 #define MOE_CACHE_PREFETCH_PER_LANE 32
 
+// shared memory of a prefetch planner: two bitmaps of the experts and one of the slots, the ranked experts, two lists as long as
+// the copies and their count
+static size_t moe_cache_prefetch_plan_smem(const int64_t n_expert, const int64_t n_slots, const int64_t n_cand, const int64_t n_copies) {
+    return (2*((n_expert + 31)/32) + (n_slots + 31)/32 + n_cand + 2*n_copies + 1)*sizeof(int32_t);
+}
+
 // one block: ranks the experts of each token by the router logits, then takes a victim for each of the first max_copies of them
 // that miss the cache, by rank (the first expert of every token, then the second, ...), as moe_cache_plan does for a lookup, but
 // spares the victims in keep and those holding an expert in the first n_rank of a token; updates the slot map, the slot owners
@@ -459,7 +470,8 @@ static __global__ void moe_cache_prefetch_plan(
     int32_t  * miss_e = miss_r + n_cand;                  // the missing experts taken
     int32_t  * miss_s = miss_e + max_copies;              // the victim of each one copied
 
-    __shared__ int n_copies;
+    // the count follows the lists: the launch needs no static shared memory, see moe_cache_prefetch_plan_smem
+    int & n_copies = miss_s[max_copies];
 
     int32_t * owner   = state + MOE_CACHE_HEADER;
     int32_t * victims = owner + n_slots;
@@ -625,7 +637,7 @@ static __global__ void moe_cache_prefetch_copy(const int32_t * __restrict__ stat
     }
 }
 
-bool ggml_cuda_moe_cache_prefetch_supported(const ggml_tensor * dst) {
+bool ggml_cuda_moe_cache_prefetch_supported(const ggml_tensor * dst, const int device) {
     const int n_banks = ggml_get_op_params_i32(dst, 1);
     if (n_banks < 1 || n_banks > 3) {
         return false;
@@ -638,11 +650,13 @@ bool ggml_cuda_moe_cache_prefetch_supported(const ggml_tensor * dst) {
             return false;
         }
     }
-    // the planner keeps the ranked experts and the slot bitmap in shared memory
-    const int64_t n_cand   = ggml_get_op_params_i32(dst, 10)*dst->src[0]->ne[1];
+    // a warp holds the logits of a token in registers, and the planner its lists and bitmaps in shared memory
     const int64_t n_expert = dst->src[2]->ne[0];
     const int64_t n_slots  = dst->src[5]->ne[2] - 1;
-    return n_cand <= 4096 && n_expert <= MOE_CACHE_PREFETCH_PER_LANE*WARP_SIZE && n_slots <= 65536;
+    const int64_t n_cand   = ggml_get_op_params_i32(dst, 10)*dst->src[0]->ne[1];
+    const int64_t n_copies = ggml_get_op_params_i32(dst, 9);
+    return n_expert <= MOE_CACHE_PREFETCH_PER_LANE*WARP_SIZE &&
+        moe_cache_prefetch_plan_smem(n_expert, n_slots, n_cand, n_copies) <= ggml_cuda_info().devices[device].smpb;
 }
 
 void ggml_cuda_moe_cache_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -675,9 +689,7 @@ void ggml_cuda_moe_cache_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
-    const int    nw   = (n_expert + 31) / 32;
-    const int    ns   = (n_slots + 31) / 32;
-    const size_t smem = (2*nw + ns)*sizeof(uint32_t) + (n_rank*n_tokens + 2*n_copies)*sizeof(int32_t);
+    const size_t smem = moe_cache_prefetch_plan_smem(n_expert, n_slots, (int64_t) n_rank*n_tokens, n_copies);
     moe_cache_prefetch_plan<<<1, MOE_CACHE_PLAN_THREADS, smem, stream>>>(
         (const float *) logits->data, n_rank, n_tokens,
         keep ? (const int32_t *) after->data : nullptr, keep ? (int) ggml_nelements(after) : 0,

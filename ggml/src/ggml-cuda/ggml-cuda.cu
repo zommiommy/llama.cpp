@@ -7094,11 +7094,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RANGE_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
         case GGML_OP_MOE_CACHE_FILL:
-            return ggml_cuda_moe_cache_fill_supported(op);
+            return ggml_cuda_moe_cache_fill_supported(op, dev_ctx->device);
         case GGML_OP_MOE_CACHE_JOIN:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32;
         case GGML_OP_MOE_CACHE_PREFETCH:
-            return ggml_cuda_moe_cache_prefetch_supported(op);
+            return ggml_cuda_moe_cache_prefetch_supported(op, dev_ctx->device);
 
         default:
             return false;
