@@ -513,6 +513,10 @@ struct llama_moe_cache::impl {
     };
     std::vector<ring> rings; // by device
 
+    // the last layer computes only the output rows of a ubatch, too few for the ring unless every token is an output
+    int32_t il_crop        = -1;
+    int64_t ring_n_outputs = 0; // the output rows of the current ubatch
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
             size_t size, size_t free, int32_t cpu_experts, int32_t tail_skip) :
             n_expert_used(model.hparams.n_expert_used_max()), free_target(free), cpu_experts(cpu_experts), tail_skip(tail_skip),
@@ -553,6 +557,7 @@ struct llama_moe_cache::impl {
             throw std::runtime_error("MoE cache requires a GPU backend");
         }
         rings.resize(devices.size());
+        il_crop = (int32_t) model.hparams.n_layer() - 1;
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
@@ -869,6 +874,14 @@ struct llama_moe_cache::impl {
         }
         ggml_backend_t backend = devices[g.id].backend;
         range_copies & copies  = devices[g.id].copies;
+
+        // a ring fill may still read the slots the moves write, as the first layer prefetched for the next ubatch
+        const ring & rg = rings[g.id];
+        for (int s = 0; s < 2; ++s) {
+            if (rg.buf && rg.layer[s] >= 0) {
+                ggml_backend_event_wait(backend, rg.filled[s]);
+            }
+        }
         size_t i = 0;
         for (int32_t s = n_new; s < r.n_active; ++s) {
             if (out[s] || r.key_of[s] < 0) {
@@ -1594,6 +1607,53 @@ struct llama_moe_cache::impl {
         return -1;
     }
 
+    // the next layer after il that the current ubatch reads from the ring of device id, after the last one the first, as the
+    // next ubatch of a long prompt starts with it; -1 if there is none
+    int32_t ring_next_bound(int32_t il, size_t id) const {
+        int32_t j = il;
+        for (size_t k = 0; k < layers.size(); ++k) {
+            j = ring_next_layer(j, id);
+            if (j < 0) {
+                j = ring_next_layer(-1, id);
+            }
+            if (j < 0) {
+                return -1;
+            }
+            if (j != il_crop || ring_n_outputs >= ring_min) {
+                return j;
+            }
+        }
+        return -1;
+    }
+
+    // a prompt ubatch fills its first two layers before its graph runs: their uploads overlap the host setting its inputs
+    // and the ops before its first experts, which waited for them
+    void ring_prefetch(int64_t n_tokens, int64_t n_outputs) {
+        ring_n_outputs = n_outputs;
+        if (n_tokens < ring_min) {
+            return;
+        }
+        for (size_t id = 0; id < rings.size(); ++id) {
+            const int32_t first = ring_next_bound(-1, id);
+            if (first < 0 || !ring_init(id)) {
+                continue;
+            }
+            const int32_t second = ring_next_bound(first, id);
+            ring & r = rings[id];
+            ggml_backend_t backend = devices[id].backend;
+            for (const int32_t il : { first, second }) {
+                if (il < 0 || r.layer[0] == il || r.layer[1] == il) {
+                    continue;
+                }
+                // the slot that holds neither layer, once the ops that read it are done
+                const int32_t s = r.layer[0] == first || r.layer[0] == second ? 1 : 0;
+                ggml_backend_event_record(r.released, backend);
+                ggml_backend_event_wait(r.copy, r.released);
+                ring_fill(r, s, il);
+            }
+        }
+    }
+
     // fill slot s with the experts of layer il on the ring stream: the cached ones from the banks, the others from host memory
     // the uploads from host memory go first: a copy between device buffers runs on the SMs, so it waits for the kernels of the
     // compute stream, and on one stream the uploads queued behind it would wait too
@@ -1680,8 +1740,10 @@ struct llama_moe_cache::impl {
             r.cur   = s;
             r.bound = il;
 
-            const int32_t next = ring_next_layer(il, id);
-            if (next >= 0 && r.layer[1 - s] != next) {
+            // the next layer this ubatch reads, after the last one the first one of the next ubatch: its upload overlaps the
+            // end of this ubatch and the host work between the two instead of the start of the next
+            const int32_t next = ring_next_bound(il, id);
+            if (next >= 0 && next != il && r.layer[1 - s] != next) {
                 ggml_backend_event_record(r.released, backend);
                 ggml_backend_event_wait(r.copy, r.released);
                 ring_fill(r, 1 - s, next);
@@ -1905,6 +1967,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
 
 bool llama_moe_cache::ring_bind(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t n_tokens) {
     return pimpl->ring_bind(backend, w, dst, n_tokens);
+}
+
+void llama_moe_cache::ring_prefetch(int64_t n_tokens, int64_t n_outputs) {
+    pimpl->ring_prefetch(n_tokens, n_outputs);
 }
 
 void llama_moe_cache::adapt(bool grow, int64_t n_tokens) {

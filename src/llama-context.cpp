@@ -1618,6 +1618,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    // a prompt ubatch uploads the experts of its first layers while the host sets its inputs
+    if (moe_cache) {
+        moe_cache->ring_prefetch(ubatch.n_tokens, n_outputs);
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
