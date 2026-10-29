@@ -1217,6 +1217,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // a draft whose layers all attend to a window of n_window positions never reads a row older than that from
+        // the last position of the batch on: its window cache evicts them unread, so a prompt batch injects its tail
+        const int32_t n_window = llama_model_n_attn_window(llama_get_model(ctx_dft));
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1230,7 +1234,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            int32_t row0 = 0;
+            if (n_window > 0) {
+                const llama_pos pos_keep = batch_in.tokens[i_batch_end[seq_id]].pos[0] - n_window;
+                while (row0 < n_rows && batch_in.tokens[i_batch_beg[seq_id] + row0].pos[0] < pos_keep) {
+                    ++row0;
+                }
+                // the positions of a sequence continue from the last one its memory holds: everything the draft
+                // holds for it is older than the skipped rows, so out of its window too, and goes
+                if (row0 > 0) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                }
+            }
+
+            for (int32_t offset = row0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather target features per extract layer; the fused decode encodes and
