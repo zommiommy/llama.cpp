@@ -127,6 +127,119 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// Prompt-sized batches sort the (token, slot) pairs by expert with a counting sort instead: the kernel above reads every
+// pair once per expert, 0.66 ms for 8192 tokens with 10 of 512 experts. The sort keeps the token order within each
+// expert, so the maps are the same.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static constexpr int mm_ids_sort_chunk      = 64;  // tokens per chunk of the sort
+static constexpr int mm_ids_sort_min_tokens = 512; // smaller batches keep the kernel above
+static constexpr int mm_ids_sort_max_experts = 1024;
+
+// counts[ic*n_experts + e]: the pairs of the tokens of chunk ic that use expert e
+static __global__ void mm_ids_sort_count(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ counts,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int si1) {
+    extern __shared__ int32_t data_mm_ids_sort_count[];
+    int32_t * hist = data_mm_ids_sort_count;
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        hist[e] = 0;
+    }
+    __syncthreads();
+
+    const int it0 = blockIdx.x*mm_ids_sort_chunk;
+    const int n   = (min(it0 + mm_ids_sort_chunk, n_tokens) - it0)*n_expert_used;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int e = ids[(it0 + i/n_expert_used)*si1 + i%n_expert_used];
+        if (e >= 0 && e < n_experts) {
+            atomicAdd(&hist[e], 1);
+        }
+    }
+    __syncthreads();
+
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        counts[blockIdx.x*n_experts + e] = hist[e];
+    }
+}
+
+// one thread per expert turns the counts into the position of the first pair of each chunk and expert, the experts in
+// order: expert_bounds[e] is the first position of expert e, expert_bounds[n_experts] the number of pairs
+static __global__ void mm_ids_sort_scan(
+        int32_t * __restrict__ offsets, int32_t * __restrict__ expert_bounds, const int n_experts, const int n_chunks) {
+    __shared__ int32_t sum[mm_ids_sort_max_experts];
+    const int e = threadIdx.x;
+
+    int total = 0;
+    if (e < n_experts) {
+        for (int ic = 0; ic < n_chunks; ++ic) {
+            const int count = offsets[ic*n_experts + e];
+            offsets[ic*n_experts + e] = total;
+            total += count;
+        }
+    }
+    sum[e] = total;
+    __syncthreads();
+    for (int offset = 1; offset < (int) blockDim.x; offset *= 2) {
+        const int add = e >= offset ? sum[e - offset] : 0;
+        __syncthreads();
+        sum[e] += add;
+        __syncthreads();
+    }
+    const int first = sum[e] - total;
+
+    if (e < n_experts) {
+        for (int ic = 0; ic < n_chunks; ++ic) {
+            offsets[ic*n_experts + e] += first;
+        }
+        expert_bounds[e] = first;
+    }
+    if (e == (int) blockDim.x - 1) {
+        expert_bounds[n_experts] = sum[e];
+    }
+}
+
+// one warp per chunk walks its pairs in token order and places them; the pairs of an expert within a group of 32 are
+// ranked by lane, and the last of them advances the expert
+static __global__ void mm_ids_sort_scatter(
+        const int32_t * __restrict__ ids, const int32_t * __restrict__ offsets,
+        int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y,
+        const int si1, const int sis1, const bool write_inverse) {
+    extern __shared__ int32_t data_mm_ids_sort_scatter[];
+    int32_t * next = data_mm_ids_sort_scatter;
+    for (int e = threadIdx.x; e < n_experts; e += WARP_SIZE) {
+        next[e] = offsets[blockIdx.x*n_experts + e];
+    }
+    __syncwarp();
+
+    const int it0 = blockIdx.x*mm_ids_sort_chunk;
+    const int n   = (min(it0 + mm_ids_sort_chunk, n_tokens) - it0)*n_expert_used;
+    for (int i0 = 0; i0 < n; i0 += WARP_SIZE) {
+        const int  i     = i0 + threadIdx.x;
+        const int  it    = it0 + i/n_expert_used;
+        const int  iex   = i%n_expert_used;
+        const int  e     = i < n ? ids[it*si1 + iex] : -1;
+        const bool valid = e >= 0 && e < n_experts;
+
+        const unsigned peers = __match_any_sync(0xFFFFFFFF, valid ? e : -1);
+        const int      pos   = valid ? next[e] + __popc(peers & ((1u << threadIdx.x) - 1)) : 0;
+        __syncwarp();
+        if (valid && (peers >> threadIdx.x) == 1) {
+            next[e] = pos + 1;
+        }
+        __syncwarp();
+
+        if (valid) {
+            ids_dst[pos] = it*n_expert_used + iex;
+            if (write_inverse) {
+                ids_src1[it*n_expert_used + iex] = pos;
+            } else {
+                ids_src1[pos] = it*sis1 + iex % nchannels_y;
+            }
+        }
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -147,9 +260,31 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
-void ggml_cuda_launch_mm_ids_helper(
+void ggml_cuda_launch_mm_ids_helper(ggml_cuda_pool & pool,
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (n_tokens >= mm_ids_sort_min_tokens && n_experts <= mm_ids_sort_max_experts &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= GGML_CUDA_CC_VOLTA) {
+        const int n_chunks = (n_tokens + mm_ids_sort_chunk - 1)/mm_ids_sort_chunk;
+        ggml_cuda_pool_alloc<int32_t> offsets(pool, (size_t) n_chunks*n_experts);
+        const size_t nbytes_shared = n_experts*sizeof(int32_t);
+
+        int n_threads_scan = WARP_SIZE;
+        while (n_threads_scan < n_experts) {
+            n_threads_scan *= 2;
+        }
+
+        mm_ids_sort_count<<<n_chunks, 256, nbytes_shared, stream>>>(ids, offsets.get(), n_experts, n_tokens, n_expert_used, si1);
+        mm_ids_sort_scan<<<1, n_threads_scan, 0, stream>>>(offsets.get(), expert_bounds, n_experts, n_chunks);
+        mm_ids_sort_scatter<<<n_chunks, WARP_SIZE, nbytes_shared, stream>>>(ids, offsets.get(), ids_src1, ids_dst,
+            n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse);
+        return;
+    }
+#else
+    GGML_UNUSED(pool);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
