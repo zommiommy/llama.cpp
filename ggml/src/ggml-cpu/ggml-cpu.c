@@ -2027,6 +2027,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_fill(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_CELLS:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
@@ -2108,6 +2109,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
+            } break;
+        case GGML_OP_TOP_K_CELLS:
+            {
+                ggml_compute_forward_top_k_cells(params, tensor);
+            } break;
+        case GGML_OP_RANGE_MASK:
+            {
+                ggml_compute_forward_range_mask(params, tensor);
             } break;
         case GGML_OP_MOE_CACHE_FILL:
         case GGML_OP_MOE_CACHE_JOIN:
@@ -2298,6 +2307,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_TOP_K_CELLS:
+        case GGML_OP_RANGE_MASK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2441,6 +2452,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_CELLS:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -3000,6 +3012,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
+                case GGML_OP_FLASH_ATTN_CELLS:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                         const int64_t DK = node->src[1]->ne[0];

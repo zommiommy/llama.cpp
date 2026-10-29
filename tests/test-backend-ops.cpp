@@ -9270,6 +9270,252 @@ struct test_top_k_mask : public test_case {
     }
 };
 
+// GGML_OP_TOP_K_CELLS
+struct test_top_k_cells : public test_case {
+    const int64_t n_kv;
+    const int64_t n_blk;   // 0: no blocks, a pick is a cell
+    const int64_t n_pick;  // number of blocks, ignored without blocks
+    const int64_t n_top;
+    const int64_t n_extra; // 0: no extra cells
+    const bool    score;   // false: every pick is live
+    const int64_t nb;      // rows per stream
+    const int64_t ns;      // streams
+
+    std::string vars() override {
+        return VARS_TO_STR8(n_kv, n_blk, n_pick, n_top, n_extra, score, nb, ns);
+    }
+
+    // the lists hold cell indices, they must match exactly
+    double max_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i] - b[i]));
+        }
+        return result;
+    }
+
+    test_top_k_cells(int64_t n_kv = 256, int64_t n_blk = 4, int64_t n_pick = 64, int64_t n_top = 16, int64_t n_extra = 3,
+            bool score = true, int64_t nb = 32, int64_t ns = 1)
+        : n_kv(n_kv), n_blk(n_blk), n_pick(n_blk ? n_pick : n_kv), n_top(n_top), n_extra(n_extra), score(score), nb(nb), ns(ns) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top, nb, 1, ns);
+        ggml_set_name(top_k, "top_k");
+
+        ggml_tensor * s = nullptr;
+        if (score) {
+            s = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_pick, nb, 1, ns);
+            ggml_set_name(s, "score");
+        }
+
+        ggml_tensor * blocks = nullptr;
+        if (n_blk > 0) {
+            blocks = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blk, n_pick);
+            ggml_set_name(blocks, "blocks");
+        }
+
+        ggml_tensor * extra = nullptr;
+        if (n_extra > 0) {
+            extra = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_extra, nb, 1, ns);
+            ggml_set_name(extra, "extra");
+        }
+
+        ggml_tensor * out = ggml_top_k_cells(ctx, top_k, s, blocks, extra, n_kv);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4B51);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "score") == 0) {
+                // -inf marks the picks a row cannot see
+                std::vector<float> data(ggml_nelements(t));
+                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                for (auto & v : data) {
+                    v = gen() % 4 == 0 ? -INFINITY : dis(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "top_k") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::vector<int32_t> order(n_pick);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    for (int64_t i = 0; i < n_pick; ++i) {
+                        order[i] = i;
+                    }
+                    std::shuffle(order.begin(), order.end(), gen);
+                    for (int64_t j = 0; j < n_top; ++j) {
+                        const bool out = j == 0 && r % 5 == 0;
+                        data[r*n_top + j] = out ? (r % 2 ? -1 : (int32_t) n_pick) : order[j % n_pick];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "blocks") == 0 || strcmp(t->name, "extra") == 0) {
+                // cells sometimes fall out of range, the op skips them
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> cell(0, n_kv - 1);
+                for (auto & c : data) {
+                    const uint32_t r = gen() % 16;
+                    c = r == 0 ? (int32_t) n_kv : r == 1 ? -1 : cell(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_FLASH_ATTN_CELLS
+struct test_flash_attn_cells : public test_case {
+    const int64_t hsk; // K head size
+    const int64_t hsv; // V head size
+    const int64_t nh;  // num KV heads
+    const std::array<int64_t, 2> nr23; // GQA ratio and streams
+    const int64_t kv;    // kv size
+    const int64_t nb;    // queries per stream
+    const int64_t n_sel; // list length
+    const ggml_type type_K;
+    const ggml_type type_V;
+    const bool holes;    // -1 entries between the cells of a list, not only after them
+
+    std::string vars() override {
+        return VARS_TO_STR10(hsk, hsv, nh, nr23, kv, nb, n_sel, type_K, type_V, holes);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (2 * nh*nr23[0] * nb * (hsk + hsv) * n_sel)*nr23[1];
+    }
+
+    test_flash_attn_cells(int64_t hsk = 256, int64_t hsv = 256, int64_t nh = 2, std::array<int64_t, 2> nr23 = {12, 1},
+            int64_t kv = 4096, int64_t nb = 64, int64_t n_sel = 515, ggml_type type_K = GGML_TYPE_F16,
+            ggml_type type_V = GGML_TYPE_F16, bool holes = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), n_sel(n_sel), type_K(type_K), type_V(type_V), holes(holes) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // K and V are views of a larger cache, permuted as llama.cpp reads them
+        auto cache_view = [&](ggml_type type, int64_t hs) {
+            ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, hs, nh, 2*kv, nr23[1]);
+            ggml_tensor * t  = ggml_view_4d(ctx, t0, hs, nh, kv, nr23[1], t0->nb[1], t0->nb[2], t0->nb[3], 0);
+            return ggml_permute(ctx, t, 0, 2, 1, 3);
+        };
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = cache_view(type_K, hsk);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = cache_view(type_V, hsv);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, nb, 1, nr23[1]);
+        ggml_set_name(cells, "cells");
+
+        ggml_tensor * out = ggml_flash_attn_cells(ctx, q, k, v, cells, 1.0f/sqrtf(hsk));
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4B52);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cells") == 0) {
+                // distinct cells per list, some lists short, the rest of a list -1
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::vector<int32_t> order(kv);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    for (int64_t i = 0; i < kv; ++i) {
+                        order[i] = i;
+                    }
+                    std::shuffle(order.begin(), order.end(), gen);
+                    const int64_t n_live = r % 3 == 0 ? 1 + (int64_t) (gen() % n_sel) : std::min(n_sel, kv);
+                    for (int64_t j = 0; j < n_sel; ++j) {
+                        const bool hole = holes && j < n_live && gen() % 8 == 0;
+                        data[r*n_sel + j] = j < n_live && j < kv && !hole ? order[j] : -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_RANGE_MASK
+struct test_range_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_cols;
+    const std::array<int64_t, 3> ne; // rows
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, n_cols, ne);
+    }
+
+    // 0 or -inf, the harness checks the -inf pattern
+    double max_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::isfinite(a[i]) && std::isfinite(b[i])) {
+                result = std::max(result, (double) fabsf(a[i] - b[i]));
+            }
+        }
+        return result;
+    }
+
+    test_range_mask(ggml_type type = GGML_TYPE_F16, int64_t n_cols = 1000, std::array<int64_t, 3> ne = {37, 1, 1})
+        : type(type), n_cols(n_cols), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ranges = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, ne[0], ne[1], ne[2]);
+        ggml_set_name(ranges, "ranges");
+
+        ggml_tensor * out = ggml_range_mask(ctx, ranges, n_cols, type);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4B53);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ranges") == 0) {
+                // empty, full, clamped and reversed ranges besides plain ones
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> col(-4, (int32_t) n_cols + 4);
+                for (size_t i = 0; i < data.size(); i += 2) {
+                    const int32_t a = col(gen), b = col(gen);
+                    data[i + 0] = std::min(a, b);
+                    data[i + 1] = gen() % 8 == 0 ? std::min(a, b) - 1 : std::max(a, b);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -10071,6 +10317,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // blocks picked per head, the mask broadcast over the heads
         test_cases.emplace_back(new test_top_k_mask(type, 512, 16, 32, 4, 0, true, 6, 4, 1));
         test_cases.emplace_back(new test_top_k_mask(type, 1024, 8, 128, 16, 8, false, 3, 2, 2));
+    }
+
+    // the cell lists of the same selections: blocks with extra cells (k-pool), cells, several streams
+    test_cases.emplace_back(new test_top_k_cells());
+    test_cases.emplace_back(new test_top_k_cells(1001, 4, 70, 16, 3, true, 7));
+    test_cases.emplace_back(new test_top_k_cells(256, 4, 64, 64, 0, true, 33));
+    test_cases.emplace_back(new test_top_k_cells(4096, 4, 1024, 512, 3, true, 64, 2));
+    test_cases.emplace_back(new test_top_k_cells(256, 0, 0, 16, 0, false, 32));
+    test_cases.emplace_back(new test_top_k_cells(512, 0, 0, 32, 5, true, 9, 3));
+    test_cases.emplace_back(new test_top_k_cells(65536, 4, 16384, 600, 3, true, 5));
+
+    // the QSA prompt attention: gqa 12, lists of 2051 cells, short lists, holes, streams, quantized cache
+    test_cases.emplace_back(new test_flash_attn_cells());
+    test_cases.emplace_back(new test_flash_attn_cells(256, 256, 2, {12, 1}, 8192, 64, 2051, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_cells(256, 256, 2, {12, 1}, 8192, 67, 2051, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_cells(256, 256, 2, {12, 2}, 4096, 33, 515, GGML_TYPE_F16, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_flash_attn_cells(256, 256, 2, {12, 1}, 1024, 65, 2051, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
+    test_cases.emplace_back(new test_flash_attn_cells(256, 256, 2, {12, 1}, 32768, 512, 2051, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_range_mask(type));
+        test_cases.emplace_back(new test_range_mask(type, 57344, {64, 1, 2}));
     }
 
     // glu ops
