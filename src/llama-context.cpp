@@ -171,6 +171,13 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// the QSA cell lists replace the selection mask from this many tokens of a sequence on
+static const llm_fused_op_probe llm_fused_op_qsa_cells_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QSA_CELLS,
+    /*.name             =*/ "QSA cell lists",
+    /*.n_tokens_per_seq =*/ LLAMA_QSA_CELLS_MIN_TOKENS,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -345,6 +352,10 @@ llama_context::llama_context(
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+
+    // the QSA models attend to the cells of their selection in prompt batches, where the backend has the ops
+    cparams.fused_qsa_cells = model.arch == LLM_ARCH_QWEN4EXP && hparams.indexer_kpool > 0;
+    cparams.auto_fqsc       = cparams.fused_qsa_cells;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -712,6 +723,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
         resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
         cparams.auto_ftkm = false;
+    }
+
+    if (cparams.auto_fqsc) {
+        LLAMA_LOG_INFO("%s: resolving QSA cell list support:\n", func);
+        resolve(llm_fused_op_qsa_cells_probe, cparams.fused_qsa_cells);
+        cparams.auto_fqsc = false;
     }
 }
 

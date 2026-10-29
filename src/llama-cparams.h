@@ -50,6 +50,8 @@ struct llama_cparams {
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    bool fused_qsa_cells;    // QSA prompt batches attend to lists of their selected cells instead of a mask
+    bool auto_fqsc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

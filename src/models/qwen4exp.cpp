@@ -726,8 +726,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos);
+        mctx->set_input_kpool(pool_cells, pool_idxs, nullptr, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
+                              ubatch, new_pool_pos, pool_ranges);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -742,7 +742,7 @@ public:
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
         res &= pool_cells->ne[0] == mctx->get_n_kpool();
-        res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
+        res &= pool_ranges->ne[1] == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // the scatter mask shape follows n_kv
         res &= n_kv              == idx->get_n_kv();
@@ -754,8 +754,12 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_ranges   = nullptr; // I32 [2, n_tokens]     first visible block and the block after the last one
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
+    // the views of pool_ranges and tail_idxs for the chunks of tokens the selection is made for, see build_inp_kpool
+    std::vector<ggml_tensor *> ranges_chunk;
+    std::vector<ggml_tensor *> tail_chunk;
+    int64_t n_chunk = 0;
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]    view of new_pool_idxs, shared by the QSA layers
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
@@ -780,18 +784,34 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
-    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+    inp->pool_ranges = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens);
+    inp->tail_idxs   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
-    ggml_set_input(inp->pool_mask);
+    ggml_set_input(inp->pool_ranges);
     ggml_set_input(inp->tail_idxs);
 
     // set_input fills them all, so keep them allocated even when no op reads them
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
-    ggml_build_forward_expand(gf, inp->pool_mask);
+    ggml_build_forward_expand(gf, inp->pool_ranges);
     ggml_build_forward_expand(gf, inp->tail_idxs);
+
+    // the selection of a prompt batch is made for chunks of its tokens: the scores of the blocks and their visibility mask
+    // are [n_pool, tokens], which at a long context take GBs for a whole batch
+    const bool    cells     = cparams.fused_qsa_cells && cparams.flash_attn && n_tokens >= LLAMA_QSA_CELLS_MIN_TOKENS;
+    const int64_t chunk_max = cells ? std::max<int64_t>(LLAMA_QSA_CELLS_MIN_TOKENS, (int64_t(1) << 27)/n_pool) : n_tokens;
+    const int64_t n_chunks  = (n_tokens + chunk_max - 1)/chunk_max;
+    inp->n_chunk = (n_tokens + n_chunks - 1)/n_chunks;
+    for (int64_t i0 = 0; i0 < n_tokens; i0 += inp->n_chunk) {
+        const int64_t n = std::min<int64_t>(inp->n_chunk, n_tokens - i0);
+        // one view per chunk for all layers: each view of a host input is a separate upload
+        const bool whole = n == n_tokens;
+        inp->ranges_chunk.push_back(whole ? inp->pool_ranges :
+            ggml_view_2d(ctx0, inp->pool_ranges, 2, n, inp->pool_ranges->nb[1], i0*inp->pool_ranges->nb[1]));
+        inp->tail_chunk.push_back(whole ? inp->tail_idxs :
+            ggml_view_2d(ctx0, inp->tail_idxs, kpool - 1, n, inp->tail_idxs->nb[1], i0*inp->tail_idxs->nb[1]));
+    }
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
@@ -876,14 +896,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
-    // which is the lightning indexer with every head weight set to that scale
-    ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    cb(score, "indexer_score", il);
-
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+
+    // the scores of the blocks for the tokens [i0, i0 + n) that ranges covers, -inf for the blocks they cannot see
+    auto build_score = [&](int64_t i0, ggml_tensor * ranges) {
+        const int64_t n = ranges->ne[1];
+        ggml_tensor * q_c = n == n_tokens ? q : ggml_view_3d(ctx0, q, idx_dim, n_idx_h, n, q->nb[1], q->nb[2], i0*q->nb[2]);
+
+        // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
+        // which is the lightning indexer with every head weight set to that scale
+        ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n), 1.0f/sqrtf((float) idx_dim));
+        // the mask of the visible blocks is built where the indexer reads it: a host input would take n_pool*n halves to
+        // fill and upload
+        ggml_tensor * mask  = ggml_range_mask(ctx0, ranges, n_pool, GGML_TYPE_F16);
+        ggml_tensor * score = ggml_lightning_indexer(ctx0, q_c, pooled, weights, mask); // [n_pool, n]
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        cb(score, "indexer_score", il);
+
+        return score;
+    };
+
+    // prompt batches list the cells of each token's selection, the attention reads only those: no mask of the
+    // whole cache per token, in memory nor in time
+    if (cparams.fused_qsa_cells && cparams.flash_attn && n_tokens >= LLAMA_QSA_CELLS_MIN_TOKENS) {
+        GGML_ASSERT(kpool*n_top_pool + kpool - 1 == inp_kpool->n_sel);
+
+        ggml_tensor * cells = nullptr;
+        for (size_t ic = 0; ic < inp_kpool->ranges_chunk.size(); ++ic) {
+            ggml_tensor * score = build_score(ic*inp_kpool->n_chunk, inp_kpool->ranges_chunk[ic]);
+            ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n], unordered
+            cb(top_k, "indexer_top_k", il);
+
+            ggml_tensor * c = ggml_top_k_cells(ctx0, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_chunk[ic], inp_kpool->n_kv);
+            res->add_fused_node({LLM_FUSED_OP_QSA_CELLS, c, il});
+
+            cells = cells ? ggml_concat(ctx0, cells, c, 1) : c;
+        }
+
+        // [n_sel, n_tokens], split into the streams of the K view by build_attn_qsa like the mask selection
+        return cells;
+    }
+
+    ggml_tensor * score = build_score(0, inp_kpool->pool_ranges);
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
@@ -956,7 +1010,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     return sel;
 }
 
-// Dense GQA self-attention over the cells that the QSA mask keeps.
+// Dense GQA self-attention over the cells that the QSA mask keeps, or over the cell list of each token.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
@@ -1001,11 +1055,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the selection replaces the kq_mask: split it into the streams of the K view
     const int64_t n_stream = k->ne[3];
-    GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+    GGML_ASSERT(sel->ne[1] % n_stream == 0);
     sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
-    cb(sel, "kq_mask_qsa", il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * cur;
+    if (sel->type == GGML_TYPE_I32) {
+        // the permutes of build_attn_mha, then each query reads the cells of its list
+        GGML_ASSERT(cparams.flash_attn && v->nb[1] <= v->nb[2]);
+        cb(sel, "indexer_cells", il);
+
+        q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        cur = ggml_flash_attn_cells(ctx0, q, k, v, sel, kq_scale);
+        res->add_fused_node({LLM_FUSED_OP_QSA_CELLS, cur, il});
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else {
+        GGML_ASSERT(sel->ne[0] == k->ne[2]);
+        cb(sel, "kq_mask_qsa", il);
+
+        cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
