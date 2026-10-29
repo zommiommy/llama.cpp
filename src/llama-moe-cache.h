@@ -51,6 +51,10 @@ public:
     // returns false if the batch is too small for the ring or w is not cached
     bool ring_bind(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t n_tokens);
 
+    // before the graph of a ubatch of n_tokens with n_outputs output rows runs: a prompt ubatch starts filling the ring with
+    // its first layers, and the last layer, which computes only the output rows, reads the ring only if they are many
+    void ring_prefetch(int64_t n_tokens, int64_t n_outputs);
+
     // elastic cache: give back the memory other buffers grew into, and with grow take free memory beyond the target
     // a batch of n_tokens too small for the ring frees it
     void adapt(bool grow, int64_t n_tokens);
