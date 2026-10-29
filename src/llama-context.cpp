@@ -2799,10 +2799,14 @@ bool llama_context::compute_elastic() const {
     return moe_cache && cparams.moe_cache_free > 0;
 }
 
-bool llama_context::sched_compute_resize(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data) {
-    // pinned host memory is slow to allocate and leaves the device memory alone
+size_t llama_context::sched_compute_resize(ggml_backend_buffer_type_t buft, size_t size_cur, size_t size_new, void * user_data) {
+    // a growing buffer takes room for the next ubatches of a prompt, whose attention grows with the context: without it
+    // every ubatch of a long prompt replaces it, which takes about 70 ms for the device buffer of an 8192-token ubatch
+    const size_t size_grow = size_new + std::min<size_t>(size_new/8, 512*1024*1024);
+
+    // pinned host memory is slow to allocate and leaves the device memory alone: it only grows
     if (ggml_backend_buft_is_host(buft)) {
-        return false;
+        return size_new > size_cur ? size_grow : size_cur;
     }
 
     auto * lctx = static_cast<llama_context *>(user_data);
@@ -2810,16 +2814,19 @@ bool llama_context::sched_compute_resize(ggml_backend_buffer_type_t buft, size_t
     // a smaller difference is not worth a reallocation: the cache grows only into more than two of its steps of free memory
     constexpr size_t shrink_min = 256*1024*1024;
 
-    const bool shrink = size_new < size_cur && size_cur - size_new >= shrink_min;
+    size_t size = size_cur;
     if (size_new > size_cur) {
-        lctx->moe_cache->make_room(ggml_backend_buft_get_device(buft), size_new - size_cur);
+        size = size_grow;
+        lctx->moe_cache->make_room(ggml_backend_buft_get_device(buft), size - size_cur);
+    } else if (size_cur - size_new >= shrink_min) {
+        size = size_new;
     }
-    if (size_new > size_cur || shrink) {
+    if (size != size_cur) {
         LLAMA_LOG_DEBUG("%s: %s compute buffer %.2f -> %.2f MiB\n", __func__, ggml_backend_buft_name(buft),
-                size_cur/1024.0/1024.0, size_new/1024.0/1024.0);
+                size_cur/1024.0/1024.0, size/1024.0/1024.0);
     }
 
-    return shrink;
+    return size;
 }
 
 ggml_status llama_context::graph_compute(
