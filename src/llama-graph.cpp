@@ -637,6 +637,18 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+const llm_attn_mask & llm_graph_input_attn_kv::get_attn_mask(int il) const {
+    const uint32_t w = mctx->get_window(il);
+    if (w != 0) {
+        for (size_t i = 0; i < win_sizes.size(); ++i) {
+            if (win_sizes[i] == w) {
+                return win_attn_mask[i];
+            }
+        }
+    }
+    return self_attn_mask;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -651,6 +663,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    for (size_t i = 0; i < win_sizes.size(); ++i) {
+        mctx->set_input_attn_mask(win_attn_mask[i], ubatch, cparams.causal_attn, win_sizes[i]);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -664,6 +680,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
+
+    for (const auto & m : win_attn_mask) {
+        res &= can_reuse_attn_mask(m, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -1207,8 +1227,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
+    // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA or per-layer windows)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+
+    for (size_t i = 0; i < inp_attn->win_sizes.size(); ++i) {
+        mctx->get_attn()->set_input_attn_mask(inp_attn->win_attn_mask[i], ubatch, cparams.causal_attn, inp_attn->win_sizes[i]);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1234,6 +1258,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    for (const auto & m : inp_attn->win_attn_mask) {
+        res &= can_reuse_attn_mask(m, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3262,6 +3290,17 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
         inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams);
+
+        // one extra mask per distinct per-layer attention window (--cache-layer ":wN" ablation)
+        for (const uint32_t w : mctx_cur->get_window_classes()) {
+            llm_attn_mask m = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams);
+            ggml_format_name(m.raw, "kq_mask_w%u", w);
+            if (m.rows) {
+                ggml_format_name(m.rows, "kv_rows_w%u", w);
+            }
+            inp->win_sizes.push_back(w);
+            inp->win_attn_mask.push_back(m);
+        }
     }
 
     inp->self_k_rot = mctx_cur->get_k_rot();
@@ -3374,8 +3413,9 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    const auto & kq_mask = inp->self_attn_mask.raw;
-    const auto & kv_rows = inp->self_attn_mask.rows;
+    const auto & attn_mask = inp->get_attn_mask(il);
+    const auto & kq_mask   = attn_mask.raw;
+    const auto & kv_rows   = attn_mask.rows;
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
