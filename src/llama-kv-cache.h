@@ -116,7 +116,8 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
                          bool   kv_lazy = false,
-                         bool   kv_share = false);
+                         bool   kv_share = false,
+  const llama_kv_layer_cfg_map * layer_cfg = nullptr);
 
     ~llama_kv_cache() = default;
 
@@ -256,7 +257,12 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // window > 0 restricts visibility to the last `window` tokens (per-layer ablation masks)
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t window = 0) const;
+
+    // per-layer attention window (0 = dense) and the set of distinct non-zero windows
+    uint32_t get_window(int32_t il) const;
+    const std::vector<uint32_t> & get_window_classes() const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
@@ -278,6 +284,9 @@ private:
         // layer index in the model
         // note: can be different from the layer index in the KV cache
         uint32_t il;
+
+        // attention window for this layer (0 = dense); mask-only, used for ablation
+        uint32_t window = 0;
 
         ggml_tensor * k;
         ggml_tensor * v;
@@ -360,6 +369,12 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // per-layer type/window overrides (copy of llama_memory_params.layer_cfg)
+    llama_kv_layer_cfg_map layer_cfg;
+
+    // distinct non-zero windows among layers (mask classes for the graph inputs)
+    std::vector<uint32_t> window_classes;
 
     size_t total_size() const;
 
@@ -470,7 +485,10 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t window = 0) const;
+
+    uint32_t get_window(int32_t il) const;
+    const std::vector<uint32_t> & get_window_classes() const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // see llama_kv_cache::get_prev_tokens()
