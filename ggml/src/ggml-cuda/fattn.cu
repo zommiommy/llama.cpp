@@ -212,6 +212,50 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
+bool ggml_cuda_flash_attn_ext_mma_f16_kv_q8_0(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    // the 2-stage cp.async pipeline of the 256/256 MMA kernel with GQA columns, no sparse or softcapped attention
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT || !ampere_mma_available(cc) || !mask ||
+            Q->ne[0] != 256 || V->ne[0] != 256 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    if (max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(dst, 4) != 0 ||
+            gqa_ratio < 2 || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+
+    // each K/V tile is converted once per tile of queries: only a batch that fits one tile avoids repeating the
+    // conversion, ncols2 as in ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2
+    const int ncols2 = gqa_ratio > 4 ? 8 : (gqa_ratio > 2 ? 4 : 2);
+    if (Q->ne[1]*ncols2 > 64) {
+        return false;
+    }
+
+    // the GQA kernel loads Q and the mask with 16 byte copies, the K/V rows are staged in 16 byte chunks
+    for (const ggml_tensor * t : {Q, K, V, mask}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->view_offs % 16 != 0 || (uintptr_t) t->data % 16 != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -828,10 +872,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            const bool kv_q8_0 = ggml_cuda_flash_attn_ext_mma_f16_kv_q8_0(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = !kv_q8_0;
+            need_f16_V = !kv_q8_0;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
