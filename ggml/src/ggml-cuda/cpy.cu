@@ -12,17 +12,10 @@ const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
 
 template <cpy_kernel_t cpy_1>
-static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne,
+static __device__ __forceinline__ void cpy_scalar_impl(const char * cx, char * cdst, const int64_t i,
                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
                                   const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
                                   const int64_t nb12, const int64_t nb13) {
-    ggml_cuda_pdl_lc();
-    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
-
-    if (i >= ne) {
-        return;
-    }
-
     // determine indices i03/i13, i02/i12, i01/i11, i00/i10 as a function of index i of flattened tensor
     // then combine those indices with the corresponding byte offsets to get the total offsets
     const int64_t i03 = i/(ne00 * ne01 * ne02);
@@ -39,6 +32,39 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
 
     ggml_cuda_pdl_sync();
     cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne,
+                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                  const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                  const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    cpy_scalar_impl<cpy_1>(cx, cdst, i, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+// cpy_scalar for gridDim.y copies of one shape, copy y reading at cx + y*src_step and writing at cdst + y*dst_step
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_batched(const char * cx, char * cdst, const int64_t src_step, const int64_t dst_step,
+                                  const int64_t ne,
+                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                  const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                  const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    cpy_scalar_impl<cpy_1>(cx + blockIdx.y*src_step, cdst + blockIdx.y*dst_step, i,
+        ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
 template <typename T>
@@ -617,6 +643,30 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
+    }
+}
+
+void ggml_cuda_cpy_batched(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1, const int n,
+                           const int64_t src_step, const int64_t dst_step) {
+    GGML_ASSERT(src0->type == src1->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16));
+    const int64_t ne = ggml_nelements(src0);
+    GGML_ASSERT(ne == ggml_nelements(src1));
+
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX && n <= USHRT_MAX);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(dim3(num_blocks, n, 1), CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
+
+    const auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, launch_params, (const char *) src0->data, (char *) src1->data, src_step, dst_step,
+            ne, src0->ne[0], src0->ne[1], src0->ne[2], (int64_t) src0->nb[0], (int64_t) src0->nb[1], (int64_t) src0->nb[2],
+            (int64_t) src0->nb[3], src1->ne[0], src1->ne[1], src1->ne[2], (int64_t) src1->nb[0], (int64_t) src1->nb[1],
+            (int64_t) src1->nb[2], (int64_t) src1->nb[3]);
+    };
+    if (src0->type == GGML_TYPE_F32) {
+        launch(cpy_scalar_batched<cpy_1_scalar<float, float>>);
+    } else {
+        launch(cpy_scalar_batched<cpy_1_scalar<half, half>>);
     }
 }
 
