@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-mma.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -313,6 +314,10 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_should_use_mmvq_mma(enum ggml_type type, int cc, int64_t ne01, int64_t ne11) {
+    return mul_mat_vec_q_mma_should_use(type, cc, ne01, ne11);
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -1578,6 +1583,14 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            mul_mat_vec_q_mma_should_use(src0->type, cc, ne01, ncols_dst)) {
+        mul_mat_vec_q_mma_switch_type(src0->data, src0->type, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst, s01,
+                                      stride_col_y, stride_col_dst, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,

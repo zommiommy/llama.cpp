@@ -11535,6 +11535,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The CUDA tensor-core path takes 4-8 columns, depending on the type, and src0 with at least 512 rows. 1029 rows
+    // leave a partial last tile of 16, and 9 quant blocks per row split unevenly over the warps and, for the 2-byte
+    // aligned types, start every other row mid-word.
+    for (ggml_type type_a : { GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS,
+                              GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS }) {
+        for (int n : {4, 6, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1029, n, 9*256, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
