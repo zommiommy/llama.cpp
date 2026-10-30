@@ -4019,6 +4019,72 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
     return skip;
 }
 
+// match a run of strided cpys of one shape whose source and destination addresses each step by a constant, like the
+// per-slot conv-state snapshots of build_conv_state, so one batched kernel does them all
+static int ggml_cuda_try_cpy_batch_fusion(const ggml_cgraph * cgraph, int node_idx, int & n_cpy, int64_t & src_step,
+                                          int64_t & dst_step) {
+    const ggml_tensor * cpy0 = cgraph->nodes[node_idx];
+    if (cpy0->op != GGML_OP_CPY || (cpy0->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = cpy0->src[0];
+    const ggml_tensor * dst0 = cpy0->src[1];
+    // contiguous copies keep their memcpy path
+    if (src0->type != dst0->type || (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
+            (ggml_is_contiguous(src0) && ggml_is_contiguous(dst0))) {
+        return 0;
+    }
+
+    int n    = 1;
+    int last = node_idx;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_CPY || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        const ggml_tensor * src = node->src[0];
+        const ggml_tensor * dst = node->src[1];
+        if (src->type != src0->type || dst->type != dst0->type ||
+                !ggml_are_same_shape(src, src0) || !ggml_are_same_stride(src, src0) ||
+                !ggml_are_same_shape(dst, dst0) || !ggml_are_same_stride(dst, dst0)) {
+            break;
+        }
+        const int64_t ds = (const char *) src->data - (const char *) src0->data;
+        const int64_t dd = (const char *) dst->data - (const char *) dst0->data;
+        if (n == 1) {
+            src_step = ds;
+            dst_step = dd;
+        } else if (ds != n*src_step || dd != n*dst_step) {
+            break;
+        }
+        ++n;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+
+    // the copies run concurrently: no destination may overlap another destination or any source
+    const int64_t src_bytes = ggml_nbytes(src0);
+    const int64_t dst_bytes = ggml_nbytes(dst0);
+    if (std::abs(dst_step) < dst_bytes) {
+        return 0;
+    }
+    const char * src_lo = (const char *) src0->data + std::min<int64_t>(0, (n - 1)*src_step);
+    const char * src_hi = (const char *) src0->data + std::max<int64_t>(0, (n - 1)*src_step) + src_bytes;
+    const char * dst_lo = (const char *) dst0->data + std::min<int64_t>(0, (n - 1)*dst_step);
+    const char * dst_hi = (const char *) dst0->data + std::max<int64_t>(0, (n - 1)*dst_step) + dst_bytes;
+    if (dst_lo < src_hi && src_lo < dst_hi) {
+        return 0;
+    }
+
+    n_cpy = n;
+    return last - node_idx;
+}
+
 // expert group selection from build_moe_ffn (n_expert_groups > 1)
 // src0/src1 index into this table, -1 is the (biased) probs, -2 is not checked
 static const struct {
@@ -4837,6 +4903,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // a run of cpys whose addresses step by constants: one batched copy
+    if (node->op == GGML_OP_CPY) {
+        int     n_cpy    = 0;
+        int64_t src_step = 0;
+        int64_t dst_step = 0;
+        const int nodes_to_skip = ggml_cuda_try_cpy_batch_fusion(cgraph, i, n_cpy, src_step, dst_step);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_cpy_batched(*cuda_ctx, node->src[0], node->src[1], n_cpy, src_step, dst_step);
             return nodes_to_skip;
         }
     }
