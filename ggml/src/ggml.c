@@ -1219,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "top_k_cells(top_k, score, blocks, extra)",
     "flash_attn_cells(q, k, v, cells)",
     "range_mask(ranges)",
-    "moe_cache_fill(ids, slot_map, state, log, banks, x)",
+    "moe_cache_fill(ids, slot_map, state, log, banks, x, weights)",
     "moe_cache_join(experts, state)",
     "moe_cache_prefetch(logits, after, slot_map, state, log, banks)",
 
@@ -6701,6 +6701,7 @@ struct ggml_tensor * ggml_range_mask(
 struct ggml_tensor * ggml_moe_cache_fill(
         struct ggml_context * ctx,
         struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights,
         struct ggml_tensor  * x,
         struct ggml_tensor  * slot_map,
         struct ggml_tensor  * state,
@@ -6712,6 +6713,8 @@ struct ggml_tensor * ggml_moe_cache_fill(
         const struct ggml_moe_cache_xchg * xchg,
         int                   skip_rank) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(weights == NULL || (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
+            ggml_nelements(weights) == ggml_nelements(ids)));
     GGML_ASSERT(slot_map->type == GGML_TYPE_I32 && ggml_is_contiguous(slot_map));
     GGML_ASSERT(state->type == GGML_TYPE_I32 && ggml_is_contiguous(state));
     GGML_ASSERT(log->type == GGML_TYPE_I32 && ggml_is_contiguous(log) && ggml_nelements(log) >= 4);
@@ -6752,6 +6755,7 @@ struct ggml_tensor * ggml_moe_cache_fill(
         result->src[4 + i] = banks[i];
     }
     result->src[7] = params[11] > 0 ? x : NULL;
+    result->src[8] = skip_rank > 0 ? weights : NULL;
 
     return result;
 }

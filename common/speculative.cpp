@@ -3080,12 +3080,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_ubatch = params_spec.n_ubatch;
     }
 
-    // the MoE cache is only used by the target context
+    // the MoE cache and top-p routing are only used by the target context
     result.moe_cache_size = 0;
     result.moe_cache_free = 0;
     result.moe_cpu_experts = 0;
     result.moe_tail_skip   = 0;
     result.moe_prefetch    = 0;
+    result.moe_top_p       = 0.0f;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

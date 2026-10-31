@@ -394,6 +394,7 @@ llama_context::llama_context(
     cparams.moe_cpu_experts = params.moe_cpu_experts;
     cparams.moe_tail_skip   = params.moe_tail_skip;
     cparams.moe_prefetch    = params.moe_prefetch;
+    cparams.moe_top_p       = params.moe_top_p;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -4537,6 +4538,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cpu_experts             =*/ 0,
         /*.moe_tail_skip               =*/ 0,
         /*.moe_prefetch                =*/ 0,
+        /*.moe_top_p                   =*/ 0.0f,
         /*.cache_layers                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

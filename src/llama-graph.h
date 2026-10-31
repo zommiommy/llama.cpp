@@ -1257,8 +1257,10 @@ struct llm_graph_context {
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     // with cpu, missing experts of the input cur [n_embd, n_tokens] can be computed by the host (see llama_moe_cache::build_fill)
+    // with weights, the weights of the selected experts, the device lookup skips a missing expert that only pairs of zero weight select
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,
+             ggml_tensor * weights,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,

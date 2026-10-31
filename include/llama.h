@@ -413,6 +413,10 @@ extern "C" {
                                  //      is skipped, its output is zero (changes the output) [EXPERIMENTAL]
         int32_t moe_prefetch;    // > 0: each MoE layer of a small batch applies the next layer's router to its own input and copies up
                                  //      to this many experts of the next layer that miss the cache, best ranked first [EXPERIMENTAL]
+        float   moe_top_p;       // > 0: top-p routing (arXiv:2403.07652) in the MoE layers with softmax routing: each token keeps the
+                                 //      fewest of its selected experts, best first, whose router probabilities (a softmax over all the
+                                 //      experts) sum to at least this, the others get zero weight, and the MoE cache does not read a
+                                 //      missing expert no token keeps (changes the output) [EXPERIMENTAL]
         // per-layer KV cache overrides: comma-separated "IL=TYPEK[/TYPEV][:wN][:rot|:norot]" entries
         // (e.g. "3=q8_0/q4_0,7=f16:w4096,*=q4_0"). "*" replaces the type_k/type_v default
         // for every attention layer; explicit IL entries win over "*". ":wN" restricts that

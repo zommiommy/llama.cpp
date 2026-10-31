@@ -1799,6 +1799,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cpu_experts = params.moe_cpu_experts;
     cparams.moe_tail_skip   = params.moe_tail_skip;
     cparams.moe_prefetch    = params.moe_prefetch;
+    cparams.moe_top_p       = params.moe_top_p;
     cparams.cache_layers = params.cache_layers.empty() ? nullptr : params.cache_layers.c_str();
 
     return cparams;

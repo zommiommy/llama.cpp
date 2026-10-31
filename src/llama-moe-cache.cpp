@@ -1490,9 +1490,9 @@ struct llama_moe_cache::impl {
     }
 
     // the slots of the experts ids [n_expert_used, n_tokens] of layer il, looked up and filled on the device; with cpu, missing
-    // experts can be left to the host, which computes them from the input x [n_embd, n_tokens]; with the tail skip or the host,
-    // build_join is required
-    ggml_tensor * build_fill(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * x, int32_t il, bool cpu) const {
+    // experts can be left to the host, which computes them from the input x [n_embd, n_tokens]; with the tail skip, the weights
+    // or the host, build_join is required
+    ggml_tensor * build_fill(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * weights, ggml_tensor * x, int32_t il, bool cpu) const {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
         const device & d = devices[g.id];
@@ -1506,9 +1506,11 @@ struct llama_moe_cache::impl {
             host[ip]  = l.experts[ip]->data;
         }
         const bool share = cpu && l.cpu && d.cpu && ggml_is_contiguous(x);
-        const int32_t skip_rank = std::min<int32_t>(tail_skip, (int32_t) ids->ne[0]);
-        return ggml_moe_cache_fill(ctx, ids, share ? x : nullptr, d.dmap, g.dstate, d.dlog, banks, host, (int) l.experts.size(), il,
-            share ? &d.cpu->xchg : nullptr, skip_rank);
+        // with the weights, a missing expert that no pair of nonzero weight selects, below the tail skip rank if set, is skipped
+        const int32_t n_used    = (int32_t) ids->ne[0];
+        const int32_t skip_rank = tail_skip > 0 ? std::min(tail_skip, n_used) : weights != nullptr ? n_used : 0;
+        return ggml_moe_cache_fill(ctx, ids, weights, share ? x : nullptr, d.dmap, g.dstate, d.dlog, banks, host, (int) l.experts.size(),
+            il, share ? &d.cpu->xchg : nullptr, skip_rank);
     }
 
     // the outputs experts [n_embd, n_expert_used, n_tokens] of layer il with those the lookup fill did not leave to the device:
@@ -2002,8 +2004,8 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
 }
 
-ggml_tensor * llama_moe_cache::build_fill(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * x, int32_t il, bool cpu) const {
-    return pimpl->build_fill(ctx, ids, x, il, cpu);
+ggml_tensor * llama_moe_cache::build_fill(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * weights, ggml_tensor * x, int32_t il, bool cpu) const {
+    return pimpl->build_fill(ctx, ids, weights, x, il, cpu);
 }
 
 ggml_tensor * llama_moe_cache::build_join(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * fill) const {

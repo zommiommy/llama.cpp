@@ -2566,6 +2566,7 @@ extern "C" {
     // device-side lookup in a cache of experts kept in the slots of device banks, for a MoE layer whose experts stay in host memory
     //
     // ids:      [n_expert_used, n_tokens] i32, the experts selected by each token
+    // weights:  NULL, or f32 with the layout of ids: the weight of each selected expert
     // x:        [n_embd, n_tokens]        f32, the input of the experts, can be NULL when xchg is NULL
     // slot_map: [n_expert, n_layer]       i32, the slot of each expert of each layer, -1 when it is not cached
     // state:    [GGML_MOE_CACHE_STATE_SIZE(n_slots, n_ids) or more] i32, see below
@@ -2578,7 +2579,8 @@ extern "C" {
     // host:     the expert tensors of layer il in host memory the device can read, one per bank
     // xchg:     can be NULL, see ggml_moe_cache_xchg
     // skip_rank: when > 0, a missing expert that no token selects at a rank below skip_rank (rank 0 is the expert of the largest
-    //           weight) is neither copied nor left to the host: its outputs are zero, and the other weights stay as they are
+    //           weight), with a nonzero weight when weights is set, is neither copied nor left to the host: its outputs are zero,
+    //           and the other weights stay as they are
     // res:      [n_expert_used, n_tokens] i32, the slot of each selected expert
     //
     // state holds the cursor into the victim list, the victim count, the copy count, the sequence number and the number of
@@ -2610,6 +2612,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_moe_cache_fill(
             struct ggml_context * ctx,
             struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
             struct ggml_tensor  * x,
             struct ggml_tensor  * slot_map,
             struct ggml_tensor  * state,

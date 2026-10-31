@@ -64,6 +64,7 @@ struct llama_cparams {
     int32_t moe_cpu_experts;
     int32_t moe_tail_skip;
     int32_t moe_prefetch;
+    float   moe_top_p;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host

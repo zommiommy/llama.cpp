@@ -30,10 +30,10 @@ public:
 
     // the slots of the experts ids [n_expert_used, n_tokens] of layer il, looked up and filled on the device without the host,
     // nullptr if the device cannot read the host experts: then the slot map is copied with the copy callback
-    // with cpu and cpu_experts, the plain SwiGLU experts of x [n_embd, n_tokens] can be left to the host when they are missing, and
-    // with tail_skip missing experts at the tail of the routes are skipped: the outputs of the down projection then go through
-    // build_join
-    ggml_tensor * build_fill(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * x, int32_t il, bool cpu) const;
+    // with cpu and cpu_experts, the plain SwiGLU experts of x [n_embd, n_tokens] can be left to the host when they are missing;
+    // with tail_skip, missing experts at the tail of the routes are skipped, and with weights, the weights of the selected experts,
+    // so are the missing experts that only pairs of zero weight select: the outputs of the down projection then go through build_join
+    ggml_tensor * build_fill(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * weights, ggml_tensor * x, int32_t il, bool cpu) const;
 
     // the outputs of the experts [n_embd, n_expert_used, n_tokens] with those the lookup fill left to the host or skipped
     ggml_tensor * build_join(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * fill) const;

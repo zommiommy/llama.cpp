@@ -58,12 +58,12 @@ static size_t moe_cache_plan_smem(const int64_t n_expert, const int64_t n_ids) {
     return (5*((n_expert + 31)/32) + 3*n_ids + 5)*sizeof(int32_t);
 }
 
-// one block: finds the selected experts in the slot map; skips the missing experts no token selects at a rank below skip_rank;
-// leaves up to cpu_max of the other missing experts to the host and posts their pairs and inputs to xchg; takes a victim for
-// each other missing expert, updates the slot map, the slot owners and the log, and leaves the copies for moe_cache_copy in the
-// state
+// one block: finds the selected experts in the slot map; skips the missing experts no token selects at a rank below skip_rank,
+// with a nonzero weight when w is set; leaves up to cpu_max of the other missing experts to the host and posts their pairs and
+// inputs to xchg; takes a victim for each other missing expert, updates the slot map, the slot owners and the log, and leaves the
+// copies for moe_cache_copy in the state
 static __global__ void moe_cache_plan(
-        const int32_t * __restrict__ ids, const int n_ids, const int n_used,
+        const int32_t * __restrict__ ids, const float * __restrict__ w, const int n_ids, const int n_used,
         const float * __restrict__ x, const int n_embd,
         int32_t * __restrict__ slot_map, int32_t * __restrict__ state, int32_t * __restrict__ log,
         int32_t * __restrict__ slots, const int il, const int n_expert, const int n_slots,
@@ -121,13 +121,14 @@ static __global__ void moe_cache_plan(
     const bool dummies = nv >= 2*n_used;
     const bool tail    = skip_rank > 0 && dummies;
 
-    // the selection of a token is ordered by weight: the best rank of an expert is its first position in any token
+    // the selection of a token is ordered by weight: the best rank of an expert is its first position in any token, where a pair
+    // of zero weight does not count
     if (tail) {
         for (int j = threadIdx.x; j < n_miss; j += blockDim.x) {
             const int e = miss_e[j];
             int r = n_used;
             for (int i = 0; i < n_ids; ++i) {
-                r = ids[i] == e ? min(r, i % n_used) : r;
+                r = ids[i] == e && (w == nullptr || w[i] != 0.0f) ? min(r, i % n_used) : r;
             }
             miss_s[j] = r;
         }
@@ -365,6 +366,9 @@ bool ggml_cuda_moe_cache_fill_supported(const ggml_tensor * dst, const int devic
             return false;
         }
     }
+    if (dst->src[8] != nullptr && dst->src[8]->type != GGML_TYPE_F32) {
+        return false;
+    }
     // the planner keeps the batch in shared memory, and the join a position per selected expert
     const int64_t n_ids    = ggml_nelements(dst->src[0]);
     const int64_t n_expert = dst->src[1]->ne[0];
@@ -386,6 +390,7 @@ void ggml_cuda_moe_cache_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_tensor       * state    = dst->src[2];
     ggml_tensor       * log      = dst->src[3];
     const ggml_tensor * x        = dst->src[7];
+    const ggml_tensor * w        = dst->src[8];
 
     const int il        = ggml_get_op_params_i32(dst, 0);
     const int n_banks   = ggml_get_op_params_i32(dst, 1);
@@ -415,7 +420,8 @@ void ggml_cuda_moe_cache_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const size_t smem = moe_cache_plan_smem(n_expert, n_ids);
     moe_cache_plan<<<1, MOE_CACHE_PLAN_THREADS, smem, stream>>>(
-        (const int32_t *) ids->data, n_ids, n_used, x != nullptr ? (const float *) x->data : nullptr, n_embd,
+        (const int32_t *) ids->data, w != nullptr ? (const float *) w->data : nullptr, n_ids, n_used,
+        x != nullptr ? (const float *) x->data : nullptr, n_embd,
         (int32_t *) slot_map->data, (int32_t *) state->data, (int32_t *) log->data,
         (int32_t *) dst->data, il, n_expert, n_slots, xchg, max_pairs, cpu_max, skip_rank, skip_off);
     CUDA_CHECK(cudaGetLastError());

@@ -2891,6 +2891,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH"));
     add_opt(common_arg(
+        {"--moe-top-p"}, "P",
+        "top-p routing (arXiv:2403.07652) in the MoE layers with softmax routing: of the experts a token selects, it keeps the "
+        "fewest, best first, whose router probabilities (a softmax over all the experts) sum to at least P, and the others get "
+        "zero weight; with the MoE cache, a missing expert that no token of a small batch keeps is not read. changes the output "
+        "(default: 0, off)",
+        [](common_params & params, const std::string & value) {
+            const float p = std::stof(value);
+            if (!(p >= 0.0f && p <= 1.0f)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_top_p = p;
+        }
+    ).set_env("LLAMA_ARG_MOE_TOP_P"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -2411,6 +2411,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
+    // top-p routing (arXiv:2403.07652): a token keeps the fewest of its experts, best first, whose probabilities reach moe_top_p,
+    // the others get zero weight; GroveMoE reads the weights of its chunk experts at other indices
+    const bool top_p = cparams.moe_top_p > 0.0f && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX &&
+        selected_experts_in == nullptr && arch != LLM_ARCH_GROVEMOE;
+    if (top_p) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+
+        // the probability of the experts ranked before each one
+        ggml_tensor * before = ggml_sub(ctx0, ggml_cumsum(ctx0, weights), weights);
+        ggml_tensor * keep   = ggml_step(ctx0, ggml_scale_bias(ctx0, before, -1.0f, cparams.moe_top_p));
+
+        weights = ggml_mul(ctx0, weights, keep);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_top_p", il);
+    }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
@@ -2451,7 +2466,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts of host-resident layers may be read from the MoE cache; the host can compute missing plain SwiGLU experts
     const bool moe_cpu = type_op == LLM_FFN_SILU && gate_exps != nullptr && up_exps != nullptr && gate_up_exps == nullptr && !weight_before_ffn;
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, cur, moe_cpu, il);
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, top_p ? weights : nullptr, up_exps, gate_exps, down_exps, gate_up_exps, cur,
+        moe_cpu, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2686,6 +2702,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * selected_experts,
+         ggml_tensor * weights,
          ggml_tensor * up_exps,
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
@@ -2722,7 +2739,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
 
     // the device looks up and fills its cache itself when it reads the host experts: the layer needs no host round trip
-    ggml_tensor * filled = moe_cache->build_fill(ctx0, ids, cur, il, cpu);
+    ggml_tensor * filled = moe_cache->build_fill(ctx0, ids, weights, cur, il, cpu);
     if (filled != nullptr && ggml_backend_supports_op(moe_cache->backend(il), filled)) {
         ggml_backend_sched_set_tensor_backend(sched, filled, moe_cache->backend(il));
         cb(filled, "ffn_moe_slots", il);
