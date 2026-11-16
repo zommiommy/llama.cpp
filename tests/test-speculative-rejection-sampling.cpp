@@ -12,7 +12,8 @@
 #include <unordered_map>
 
 // Tests that common_sampler_sample_and_accept_n_rejection preserves the target
-// distribution regardless of what the draft distribution Q looks like.
+// distribution regardless of what the draft distribution Q looks like, for a
+// single draft token and for a block of draft tokens.
 
 static int test_speculative_rejection_sampling(common_params & params, int n_trials) {
     params.sampling.backend_sampling = false;
@@ -38,7 +39,9 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     common_params_sampling sampling;
     sampling.seed     = 18;
     sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
-    sampling.temp     = 1.0f;
+    // the test model's logits are nearly flat; a sharp target tells it apart from the random drafts, so a verifier
+    // that lets draft tokens through fails
+    sampling.temp     = 0.05f;
 
     // Initialize the sampler for the target model.
     common_sampler_ptr smpl(common_sampler_init(model_tgt, sampling));
@@ -67,15 +70,14 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     std::mt19937 rng(18);
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
-    std::unordered_map<llama_token, int> token_counts;
-
     std::vector<llama_token_data> q(n_vocab);
     for (int i = 0; i < n_vocab; ++i) {
         q[i].id = i;
         q[i].logit = 0.0f;
     }
 
-    for (int trial = 0; trial < n_trials; ++trial) {
+    // a random draft distribution and a token drawn from it
+    auto draw_draft = [&](llama_token & tok) {
         float q_sum = 0.0f;
 
         for (auto & td : q) {
@@ -91,69 +93,90 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         float u = uni(rng);
 
         // Fallback to the last bucket to absorb residual probability from FP precision loss
-        llama_token draft_tok = q.back().id;
+        tok = q.back().id;
         for (const auto & e : q) {
             u -= e.p;
             if (u <= 0.0f) {
-                draft_tok = e.id;
+                tok = e.id;
                 break;
             }
         }
-
-        // Both indices reuse the prompt's last output logits. The second entry
-        // is the bonus draw slot; it is always stale and its result is ignored.
-        const llama_tokens draft = { draft_tok };
-        const std::vector<std::vector<llama_token_data>> draft_q = { q };
-        const std::vector<int> idxs = { -1, -1 };
-
-        const std::vector<llama_token> result =
-            common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, false);
-
-        token_counts[result[0]]++;
-    }
-
-    LOG("\n");
-    LOG("Empirical vs target distribution after %d trials:\n", n_trials);
-
-    bool   ok      = true;
-    size_t covered = 0;
-
-    auto get_count_for = [&](llama_token id) -> int {
-        const auto it = token_counts.find(id);
-        return it != token_counts.end() ? it->second : 0;
+        return q;
     };
 
-    // Iterate over the target distribution
-    for (size_t i = 0; i < dist_tgt->size; ++i) {
-        const llama_token id  = dist_tgt->data[i].id;
-        const float       p_t = dist_tgt->data[i].p;
+    bool ok = true;
 
-        const int   count = get_count_for(id);
-        const float p_e   = (float) count / n_trials;
-        const float diff  = std::fabs(p_t - p_e);
+    // Every index reuses the prompt's last output logits, so the target draws every token from the same
+    // distribution and the first two tokens of the output must each follow it. With one draft token, the bonus draw
+    // of the second index is stale and only the first output token is checked.
+    for (const int n_draft : { 1, 3 }) {
+        const int n_check = n_draft == 1 ? 1 : 2;
 
-        // We only deal with ids in dist_tgt, and if each trial result was one
-        // of dist_tgt's candidates then covered ends up equal to the number of
-        // trials. If not this inconsistency tells us how many trials produced
-        // a token outside of the target's distribution.
-        covered += count;
+        std::vector<std::unordered_map<llama_token, int>> token_counts(n_check);
 
-        const float standard_error = std::sqrt(p_t * (1.0f - p_t) / n_trials);
-        const float tolerance      = 6.0f * standard_error;
+        for (int trial = 0; trial < n_trials; ++trial) {
+            std::vector<llama_token> out;
+            while ((int) out.size() < n_check) {
+                llama_tokens draft(n_draft);
+                std::vector<std::vector<llama_token_data>> draft_q(n_draft);
+                for (int i = 0; i < n_draft; ++i) {
+                    draft_q[i] = draw_draft(draft[i]);
+                }
+                const std::vector<int> idxs(n_draft + 1, -1);
 
-        LOG("token %3d : target = %f, empirical = %f, diff = %f, tol = %f\n", id, p_t, p_e, diff, tolerance);
-
-        if (diff > tolerance) {
-            LOG_ERR("token %d: empirical probability %f too far from target %f (diff %f > tol %f)\n",
-                    id, p_e, p_t, diff, tolerance);
-            ok = false;
+                const std::vector<llama_token> result =
+                    common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, false);
+                out.insert(out.end(), result.begin(), result.end());
+            }
+            for (int k = 0; k < n_check; ++k) {
+                token_counts[k][out[k]]++;
+            }
         }
-    }
 
-    if (covered != (size_t) n_trials) {
-        LOG_ERR("%zu of %d trials produced a token outside dist_tgt's candidates\n",
-                (size_t) n_trials - covered, n_trials);
-        ok = false;
+        for (int k = 0; k < n_check; ++k) {
+            LOG("\n");
+            LOG("%d draft tokens, output token %d: empirical vs target distribution after %d trials:\n", n_draft, k, n_trials);
+
+            size_t covered = 0;
+
+            auto get_count_for = [&](llama_token id) -> int {
+                const auto it = token_counts[k].find(id);
+                return it != token_counts[k].end() ? it->second : 0;
+            };
+
+            // Iterate over the target distribution
+            for (size_t i = 0; i < dist_tgt->size; ++i) {
+                const llama_token id  = dist_tgt->data[i].id;
+                const float       p_t = dist_tgt->data[i].p;
+
+                const int   count = get_count_for(id);
+                const float p_e   = (float) count / n_trials;
+                const float diff  = std::fabs(p_t - p_e);
+
+                // We only deal with ids in dist_tgt, and if each trial result was one
+                // of dist_tgt's candidates then covered ends up equal to the number of
+                // trials. If not this inconsistency tells us how many trials produced
+                // a token outside of the target's distribution.
+                covered += count;
+
+                const float standard_error = std::sqrt(p_t * (1.0f - p_t) / n_trials);
+                const float tolerance      = 6.0f * standard_error;
+
+                LOG("token %3d : target = %f, empirical = %f, diff = %f, tol = %f\n", id, p_t, p_e, diff, tolerance);
+
+                if (diff > tolerance) {
+                    LOG_ERR("%d draft tokens, output token %d: token %d: empirical probability %f too far from target %f (diff %f > tol %f)\n",
+                            n_draft, k, id, p_e, p_t, diff, tolerance);
+                    ok = false;
+                }
+            }
+
+            if (covered != (size_t) n_trials) {
+                LOG_ERR("%zu of %d trials produced a token outside dist_tgt's candidates\n",
+                        (size_t) n_trials - covered, n_trials);
+                ok = false;
+            }
+        }
     }
 
     if (!ok) {
