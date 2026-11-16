@@ -376,10 +376,9 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    cparams.kv_lazy             = params.kv_lazy;
-    cparams.kv_share            = params.kv_share;
-    cparams.moe_cache_size      = params.moe_cache_size;
-    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.kv_lazy        = params.kv_lazy;
+    cparams.kv_share       = params.kv_share;
+    cparams.moe_cache_size = params.moe_cache_size;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -619,7 +618,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
         sched_reserve();
@@ -4454,7 +4453,6 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
-        /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.cache_layers                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
