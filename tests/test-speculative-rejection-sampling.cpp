@@ -179,6 +179,51 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         }
     }
 
+    // XTC drops the most probable tokens when it fires, at random each time the chain is applied: the first output
+    // token is the top token of the target only when XTC does not fire, half of the time. A verifier that applies the
+    // chain to a copy of the sampler would repeat the copy's draws, firing always or never.
+    {
+        common_params_sampling sampling_xtc = sampling;
+        sampling_xtc.samplers        = { COMMON_SAMPLER_TYPE_TEMPERATURE, COMMON_SAMPLER_TYPE_XTC };
+        sampling_xtc.xtc_probability = 0.5f;
+        sampling_xtc.xtc_threshold   = 0.1f;
+
+        common_sampler_ptr smpl_xtc(common_sampler_init(model_tgt, sampling_xtc));
+        if (!smpl_xtc) {
+            LOG_ERR("failed to initialize the XTC sampler\n");
+            return 1;
+        }
+
+        // XTC keeps the least probable of the tokens above its threshold, so it drops the top one if two are above
+        GGML_ASSERT(dist_tgt->size > 1 && dist_tgt->data[1].p >= sampling_xtc.xtc_threshold);
+        const llama_token top = dist_tgt->data[0].id;
+
+        int count = 0;
+        for (int trial = 0; trial < n_trials; ++trial) {
+            const int n_draft = 3;
+            llama_tokens draft(n_draft);
+            std::vector<std::vector<llama_token_data>> draft_q(n_draft);
+            for (int i = 0; i < n_draft; ++i) {
+                draft_q[i] = draw_draft(draft[i]);
+            }
+            const std::vector<int> idxs(n_draft + 1, -1);
+
+            const std::vector<llama_token> result =
+                common_sampler_sample_and_accept_n_rejection(smpl_xtc.get(), ctx_tgt, idxs, draft, draft_q, false);
+            count += result[0] == top;
+        }
+
+        const float p_t       = 0.5f * dist_tgt->data[0].p;
+        const float p_e       = (float) count / n_trials;
+        const float tolerance = 6.0f * std::sqrt(p_t * (1.0f - p_t) / n_trials);
+
+        LOG("\nXTC: top token %d: target = %f, empirical = %f, tol = %f\n", top, p_t, p_e, tolerance);
+        if (std::fabs(p_t - p_e) > tolerance) {
+            LOG_ERR("XTC: top token %d: empirical probability %f too far from target %f (tol %f)\n", top, p_e, p_t, tolerance);
+            ok = false;
+        }
+    }
+
     if (!ok) {
         return 1;
     }
